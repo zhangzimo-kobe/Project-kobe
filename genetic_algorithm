@@ -1,0 +1,794 @@
+import numpy as np
+import random
+import copy
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import pandas as pd
+from typing import List, Tuple, Dict, Optional
+import time
+
+
+class MultiObjectiveGA:
+    """
+    双目标遗传算法求解疏散路径优化问题
+
+    目标1: 最小化总步行距离（需求量 × 距离）
+    目标2: 最小化总穿越次数（需求量 × 穿越次数）
+    """
+    def __init__(self, road_network,
+                 population_size: int = 100,
+                 max_generations: int = 200,
+                 crossover_rate: float = 0.8,
+                 mutation_rate: float = 0.1,
+                 dmax: float = 1500,
+                 use_dynamic_dmax: bool = True):
+        """
+        初始化遗传算法
+
+        Args:
+            road_network: RoadNetworkSelector实例
+            population_size: 种群大小
+            max_generations: 最大迭代次数
+            crossover_rate: 交叉概率
+            mutation_rate: 变异概率
+            dmax: 最大步行距离限制(米)
+        """
+        self.road_network = road_network
+        self.population_size = population_size
+        self.max_generations = max_generations
+        self.crossover_rate = crossover_rate
+        self.mutation_rate = mutation_rate
+        self.dmax = dmax
+        self.use_dynamic_dmax = use_dynamic_dmax  # 新增
+        self.dynamic_dmax = dmax  # 新增：动态距离限制值
+
+        # 提取问题数据
+        self._extract_problem_data()
+
+        # 算法状态
+        self.population = []
+        self.pareto_front = []
+        self.generation = 0
+        self.history = {
+            'best_obj1': [],
+            'best_obj2': [],
+            'pareto_size': [],
+            'generation': []
+        }
+        print(f"双目标遗传算法初始化完成")
+        print(f"需求点数量: {self.num_demands}")
+        print(f"集合点数量: {self.num_gathering}")
+        print(f"种群大小: {self.population_size}")
+        print(f"最大迭代次数: {self.max_generations}")
+
+
+    def _extract_problem_data(self):
+        """从路网选择器中提取问题数据"""
+        # 检查必要数据
+        if not hasattr(self.road_network, 'region_centroid_nodes') or not self.road_network.region_centroid_nodes:
+            raise ValueError("没有找到需求点，请先完成路网选择")
+
+        if not hasattr(self.road_network, 'gathering_points') or not self.road_network.gathering_points:
+            raise ValueError("没有找到集合点，请先选择集合点")
+
+        if not hasattr(self.road_network, 'distance_matrix') or self.road_network.distance_matrix is None:
+            raise ValueError("没有找到距离矩阵，请先计算距离")
+
+        if not hasattr(self.road_network, 'demand_quantities') or not self.road_network.demand_quantities:
+            raise ValueError("没有找到需求量数据，请先输入需求量")
+
+        # 提取需求点信息
+        self.demand_nodes = [node_id for node_id, _ in self.road_network.region_centroid_nodes]
+        self.num_demands = len(self.demand_nodes)
+
+        # 提取集合点信息
+        self.gathering_nodes = list(self.road_network.gathering_points)
+        self.num_gathering = len(self.gathering_nodes)
+
+        # 提取需求量
+        self.demands = np.array([self.road_network.demand_quantities.get(node, 0)
+                                 for node in self.demand_nodes])
+
+        # 提取容量
+        self.capacities = np.array([self.road_network.gathering_point_capacities.get(node, 0)
+                                    for node in self.gathering_nodes])
+
+        # 提取距离矩阵（先用原始dmax）
+        distance_df = self.road_network.distance_matrix
+        self.distance_matrix = np.full((self.num_demands, self.num_gathering), np.inf)
+        for i, demand_node in enumerate(self.demand_nodes):
+            for j, gathering_node in enumerate(self.gathering_nodes):
+                if demand_node in distance_df.index and gathering_node in distance_df.columns:
+                    distance = distance_df.loc[demand_node, gathering_node]
+                    if not np.isinf(distance) and distance <= self.dmax:
+                        self.distance_matrix[i, j] = distance
+
+        # 计算动态距离限制
+        if self.use_dynamic_dmax:
+            self.dynamic_dmax = self.calculate_dynamic_dmax()
+
+            # 重新构建距离矩阵（使用动态dmax）
+            self.distance_matrix = np.full((self.num_demands, self.num_gathering), np.inf)
+            for i, demand_node in enumerate(self.demand_nodes):
+                for j, gathering_node in enumerate(self.gathering_nodes):
+                    if demand_node in distance_df.index and gathering_node in distance_df.columns:
+                        distance = distance_df.loc[demand_node, gathering_node]
+                        if not np.isinf(distance) and distance <= self.dynamic_dmax:
+                            self.distance_matrix[i, j] = distance
+
+            print(f"使用动态距离限制重构距离矩阵完成")
+        else:
+            self.dynamic_dmax = self.dmax
+            print(f"使用固定距离限制: {self.dmax:.1f}米")
+
+        # 提取穿越次数矩阵
+        self.crossing_matrix = self._get_crossing_matrix()
+        print(f"问题数据提取完成:")
+        print(f"  需求点: {self.demand_nodes}")
+        print(f"  集合点: {self.gathering_nodes}")
+        print(f"  需求量: {self.demands}")
+        print(f"  容量: {self.capacities}")
+        print(f"  总需求量: {np.sum(self.demands)}")
+        print(f"  总容量: {np.sum(self.capacities)}")
+
+    def calculate_dynamic_dmax(self):
+        """根据路网特征动态计算最大距离限制"""
+        if self.distance_matrix is None:
+            print("警告：距离矩阵为空，使用固定dmax值")
+            return self.dmax
+
+        # 获取所有有效距离
+        valid_distances = []
+        for i in range(self.num_demands):
+            for j in range(self.num_gathering):
+                dist = self.distance_matrix[i, j]
+                if not np.isinf(dist) and not np.isnan(dist):
+                    valid_distances.append(dist)
+
+        if not valid_distances:
+            print("警告：没有找到有效距离，使用固定dmax值")
+            return self.dmax
+
+        valid_distances = np.array(valid_distances)
+
+        # 计算统计量
+        mean_dist = np.mean(valid_distances)
+        std_dist = np.std(valid_distances)
+        percentile_90 = np.percentile(valid_distances, 90)
+        percentile_75 = np.percentile(valid_distances, 75)
+
+        # 动态计算dmax（使用多种策略的最小值）
+        strategy_1 = mean_dist + 1.5 * std_dist  # 统计学方法
+        strategy_2 = percentile_90  # 90分位数方法
+        strategy_3 = percentile_75 * 1.3  # 75分位数*1.3
+        strategy_4 = self.dmax * 1.2  # 不超过原限制的1.2倍
+
+        dynamic_dmax = min(strategy_1, strategy_2, strategy_3, strategy_4)
+
+        # 确保不小于最短距离的1.5倍
+        min_dist = np.min(valid_distances)
+        dynamic_dmax = max(dynamic_dmax, min_dist * 1.5)
+
+        print(f"动态距离限制计算结果:")
+        print(f"  平均距离: {mean_dist:.1f}米")
+        print(f"  标准差: {std_dist:.1f}米")
+        print(f"  90分位数: {percentile_90:.1f}米")
+        print(f"  75分位数: {percentile_75:.1f}米")
+        print(f"  策略1(均值+1.5σ): {strategy_1:.1f}米")
+        print(f"  策略2(90分位数): {strategy_2:.1f}米")
+        print(f"  策略3(75分位数*1.3): {strategy_3:.1f}米")
+        print(f"  策略4(原限制*1.2): {strategy_4:.1f}米")
+        print(f"  最终动态dmax: {dynamic_dmax:.1f}米 (原固定值: {self.dmax:.1f}米)")
+
+        return dynamic_dmax
+
+    def _get_crossing_matrix(self):
+        """获取穿越次数矩阵"""
+        if hasattr(self.road_network, 'crossing_matrix') and self.road_network.crossing_matrix is not None:
+            return self.road_network.crossing_matrix
+        else:
+            # 如果没有穿越矩阵，返回零矩阵
+            print("警告：没有找到穿越次数矩阵，使用零矩阵")
+            return np.zeros((self.num_demands, self.num_gathering))
+
+    def _is_feasible_assignment(self, assignment: np.ndarray) -> bool:
+        """
+        检查分配方案是否可行
+
+        Args:
+            assignment: 分配方案，assignment[i] = j 表示需求点i分配给集合点j，-1表示未分配
+
+        Returns:
+            bool: 是否可行
+        """
+        # 检查容量约束
+        for j in range(self.num_gathering):
+            total_demand = np.sum(self.demands[assignment == j])
+            if total_demand > self.capacities[j]:
+                return False
+
+        # 检查距离约束
+        for i in range(self.num_demands):
+            j = assignment[i]
+            if j != -1 and self.distance_matrix[i, j] > self.dynamic_dmax:
+                return False
+
+        return True
+
+    def _generate_random_individual(self) -> np.ndarray:
+        """
+        生成一个随机的可行个体
+
+        Returns:
+            np.ndarray: 分配方案
+        """
+        max_attempts = 1000
+
+        for attempt in range(max_attempts):
+            assignment = np.full(self.num_demands, -1)
+
+            # 随机排列需求点顺序
+            demand_order = np.random.permutation(self.num_demands)
+
+            for i in demand_order:
+                # 找到可行的集合点
+                feasible_gatherings = []
+                for j in range(self.num_gathering):
+                    # 检查距离约束
+                    if self.distance_matrix[i, j] <= self.dynamic_dmax:
+                        # 检查容量约束
+                        current_load = np.sum(self.demands[assignment == j])
+                        if current_load + self.demands[i] <= self.capacities[j]:
+                            feasible_gatherings.append(j)
+
+                if feasible_gatherings:
+                    # 随机选择一个可行集合点
+                    j = random.choice(feasible_gatherings)
+                    assignment[i] = j
+                else:
+                    # 无可行分配，重新开始
+                    break
+            else:
+                # 所有需求点都成功分配
+                if np.all(assignment != -1):
+                    return assignment
+
+        # 如果无法生成可行解，使用贪心方法
+        return self._generate_greedy_individual()
+
+    def _generate_greedy_individual(self) -> np.ndarray:
+        """
+        使用贪心算法生成个体
+
+        Returns:
+            np.ndarray: 分配方案
+        """
+        assignment = np.full(self.num_demands, -1)
+
+        # 按需求量从小到大排序
+        demand_order = np.argsort(self.demands)
+
+        for i in demand_order:
+            best_j = -1
+            best_cost = np.inf
+            for j in range(self.num_gathering):
+                # 检查约束
+                if (self.distance_matrix[i, j] <= self.dynamic_dmax and
+                        np.sum(self.demands[assignment == j]) + self.demands[i] <= self.capacities[j]):
+
+                    # 计算成本（距离 + 穿越次数的加权和）
+                    cost = self.distance_matrix[i, j] + self.crossing_matrix[i, j]
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_j = j
+
+            if best_j != -1:
+                assignment[i] = best_j
+
+        return assignment
+
+    def _calculate_objectives(self, assignment: np.ndarray) -> Tuple[float, float]:
+        """
+        计算目标函数值
+
+        Args:
+            assignment: 分配方案
+
+        Returns:
+            Tuple[float, float]: (总步行距离, 总穿越次数)
+        """
+        total_distance = 0.0
+        total_crossings = 0.0
+        for i in range(self.num_demands):
+            j = assignment[i]
+            if j != -1:
+                total_distance += self.demands[i] * self.distance_matrix[i, j]
+                total_crossings += self.demands[i] * self.crossing_matrix[i, j]
+
+        return total_distance, total_crossings
+
+    def _dominates(self, obj1: Tuple[float, float], obj2: Tuple[float, float]) -> bool:
+        """
+        判断目标1是否支配目标2
+
+        Args:
+            obj1: 目标函数值1
+            obj2: 目标函数值2
+
+        Returns:
+            bool: obj1是否支配obj2
+        """
+        return (obj1[0] <= obj2[0] and obj1[1] <= obj2[1] and
+                (obj1[0] < obj2[0] or obj1[1] < obj2[1]))
+
+    def _initialize_population(self):
+        """初始化种群"""
+        print("正在初始化种群...")
+        self.population = []
+
+        for i in range(self.population_size):
+            if i % 20 == 0:
+                print(f"  生成个体 {i + 1}/{self.population_size}")
+            assignment = self._generate_random_individual()
+            objectives = self._calculate_objectives(assignment)
+
+            self.population.append({
+                'assignment': assignment,
+                'objectives': objectives,
+                'rank': 0,
+                'crowding_distance': 0.0
+            })
+
+        print(f"种群初始化完成，共 {len(self.population)} 个个体")
+
+    def _fast_non_dominated_sort(self):
+        """快速非支配排序"""
+        fronts = [[]]
+
+        for i, individual_i in enumerate(self.population):
+            individual_i['domination_count'] = 0
+            individual_i['dominated_solutions'] = []
+            for j, individual_j in enumerate(self.population):
+                if i != j:
+                    if self._dominates(individual_i['objectives'], individual_j['objectives']):
+                        individual_i['dominated_solutions'].append(j)
+                    elif self._dominates(individual_j['objectives'], individual_i['objectives']):
+                        individual_i['domination_count'] += 1
+
+            if individual_i['domination_count'] == 0:
+                individual_i['rank'] = 0
+                fronts[0].append(i)
+
+        i = 0
+        while len(fronts[i]) > 0:
+            next_front = []
+            for p in fronts[i]:
+                for q in self.population[p]['dominated_solutions']:
+                    self.population[q]['domination_count'] -= 1
+                    if self.population[q]['domination_count'] == 0:
+                        self.population[q]['rank'] = i + 1
+                        next_front.append(q)
+            i += 1
+            fronts.append(next_front)
+
+        return fronts[:-1]
+
+    def _calculate_crowding_distance(self, front: List[int]):
+        """计算拥挤度距离"""
+        if len(front) <= 2:
+            for i in front:
+                self.population[i]['crowding_distance'] = np.inf
+            return
+
+        # 初始化距离
+        for i in front:
+            self.population[i]['crowding_distance'] = 0.0
+
+        # 对每个目标函数
+        for obj_idx in range(2):
+            # 按目标函数值排序
+            front.sort(key=lambda x: self.population[x]['objectives'][obj_idx])
+
+            # 边界点设为无穷大
+            self.population[front[0]]['crowding_distance'] = np.inf
+            self.population[front[-1]]['crowding_distance'] = np.inf
+
+            # 计算目标函数范围
+            obj_min = self.population[front[0]]['objectives'][obj_idx]
+            obj_max = self.population[front[-1]]['objectives'][obj_idx]
+            obj_range = obj_max - obj_min
+
+            if obj_range > 0:
+                for i in range(1, len(front) - 1):
+                    distance = (self.population[front[i + 1]]['objectives'][obj_idx] -
+                                self.population[front[i - 1]]['objectives'][obj_idx]) / obj_range
+                    self.population[front[i]]['crowding_distance'] += distance
+
+    def _tournament_selection(self) -> int:
+        """锦标赛选择"""
+        tournament_size = 2  # 二元锦标赛
+        tournament = random.sample(range(len(self.population)), tournament_size)
+        best = tournament[0]
+        for i in tournament[1:]:
+            # 比较等级
+            if self.population[i]['rank'] < self.population[best]['rank']:
+                best = i
+            elif (self.population[i]['rank'] == self.population[best]['rank'] and
+                  self.population[i]['crowding_distance'] > self.population[best]['crowding_distance']):
+                best = i
+
+        return best
+
+    def _crossover(self, parent1: np.ndarray, parent2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """二点交叉操作"""
+        if random.random() > self.crossover_rate:
+            return parent1.copy(), parent2.copy()
+
+        # 二点交叉
+        point1 = random.randint(1, self.num_demands - 2)
+        point2 = random.randint(point1 + 1, self.num_demands - 1)
+
+        child1 = parent1.copy()
+        child2 = parent2.copy()
+
+        # 中間部分を交換
+        child1[point1:point2] = parent2[point1:point2]
+        child2[point1:point2] = parent1[point1:point2]
+
+        # 修復不可行解
+        child1 = self._repair_individual(child1)
+        child2 = self._repair_individual(child2)
+
+        return child1, child2
+
+    def _mutate(self, individual: np.ndarray) -> np.ndarray:
+        """变异操作"""
+        if random.random() > self.mutation_rate:
+            return individual.copy()
+
+        mutated = individual.copy()
+
+        # 随机选择一个需求点进行变异
+        i = random.randint(0, self.num_demands - 1)
+
+        # 找到可行的集合点
+        feasible_gatherings = []
+        for j in range(self.num_gathering):
+            if j != mutated[i] and self.distance_matrix[i, j] <= self.dynamic_dmax:
+                # 检查容量约束
+                current_load = np.sum(self.demands[mutated == j])
+                if current_load + self.demands[i] <= self.capacities[j]:
+                    feasible_gatherings.append(j)
+
+        if feasible_gatherings:
+            old_j = mutated[i]
+            new_j = random.choice(feasible_gatherings)
+            mutated[i] = new_j
+
+        return mutated
+
+    def _repair_individual(self, individual: np.ndarray) -> np.ndarray:
+        """修复不可行个体"""
+        repaired = individual.copy()
+
+        # 检查并修复容量约束违反
+        for j in range(self.num_gathering):
+            assigned_demands = np.where(repaired == j)[0]
+            total_demand = np.sum(self.demands[assigned_demands])
+
+            if total_demand > self.capacities[j]:
+                # 按需求量从大到小排序，移除多余的需求点
+                demand_order = assigned_demands[np.argsort(-self.demands[assigned_demands])]
+                current_load = 0
+
+                for i in demand_order:
+                    if current_load + self.demands[i] <= self.capacities[j]:
+                        current_load += self.demands[i]
+                    else:
+                        # 重新分配这个需求点
+                        repaired[i] = self._find_feasible_gathering(i, repaired)
+
+        return repaired
+
+    def _find_feasible_gathering(self, demand_idx: int, current_assignment: np.ndarray) -> int:
+        """为需求点找到可行的集合点"""
+        for j in range(self.num_gathering):
+            if (self.distance_matrix[demand_idx, j] <= self.dynamic_dmax and
+                    np.sum(self.demands[current_assignment == j]) + self.demands[demand_idx] <= self.capacities[j]):
+                return j
+        return -1  # 无可行分配
+
+    def _environmental_selection(self, fronts: List[List[int]]):
+        """环境选择"""
+        new_population = []
+
+        for front in fronts:
+            if len(new_population) + len(front) <= self.population_size:
+                # 整个前沿都可以加入
+                new_population.extend(front)
+            else:
+                # 只能加入部分个体
+                remaining_slots = self.population_size - len(new_population)
+                self._calculate_crowding_distance(front)
+
+                # 按拥挤度距离降序排序
+                front.sort(key=lambda x: self.population[x]['crowding_distance'], reverse=True)
+                new_population.extend(front[:remaining_slots])
+                break
+
+        # 更新种群
+        self.population = [self.population[i] for i in new_population]
+
+    def _update_pareto_front(self):
+        """更新帕累托前沿"""
+        # 找到第一层前沿
+        first_front = []
+        for i, individual in enumerate(self.population):
+            if individual['rank'] == 0:
+                first_front.append(individual)
+
+        self.pareto_front = first_front
+
+    def _record_history(self):
+        """记录历史信息"""
+        if self.pareto_front:
+            objectives = [ind['objectives'] for ind in self.pareto_front]
+            obj1_values = [obj[0] for obj in objectives]
+            obj2_values = [obj[1] for obj in objectives]
+
+            self.history['best_obj1'].append(min(obj1_values))
+            self.history['best_obj2'].append(min(obj2_values))
+            self.history['pareto_size'].append(len(self.pareto_front))
+        else:
+            self.history['best_obj1'].append(float('inf'))
+            self.history['best_obj2'].append(float('inf'))
+            self.history['pareto_size'].append(0)
+
+        self.history['generation'].append(self.generation)
+
+    def run(self) -> List[Dict]:
+        """
+        运行遗传算法
+
+        Returns:
+            List[Dict]: 帕累托最优解集
+        """
+        print("\n" + "=" * 60)
+        print("开始运行双目标遗传算法")
+        print("=" * 60)
+
+        start_time = time.time()
+
+        # 初始化种群
+        self._initialize_population()
+
+        for generation in range(self.max_generations):
+            self.generation = generation
+
+            # 非支配排序
+            fronts = self._fast_non_dominated_sort()
+
+            # 计算拥挤度距离
+            for front in fronts:
+                self._calculate_crowding_distance(front)
+
+            # 更新帕累托前沿
+            self._update_pareto_front()
+
+            # 记录历史
+            self._record_history()
+
+            # 输出进度
+            if generation % 20 == 0 or generation == self.max_generations - 1:
+                print(f"第 {generation + 1} 代: 帕累托前沿大小 = {len(self.pareto_front)}")
+                if self.pareto_front:
+                    best_dist = min([ind['objectives'][0] for ind in self.pareto_front])
+                    best_cross = min([ind['objectives'][1] for ind in self.pareto_front])
+                    print(f"  最佳距离: {best_dist:.2f}, 最佳穿越: {best_cross:.2f}")
+
+            # 如果不是最后一代，进行繁殖
+            if generation < self.max_generations - 1:
+                # 创建子代
+                offspring = []
+                while len(offspring) < self.population_size:
+                    # 选择父母
+                    parent1_idx = self._tournament_selection()
+                    parent2_idx = self._tournament_selection()
+
+                    parent1 = self.population[parent1_idx]['assignment']
+                    parent2 = self.population[parent2_idx]['assignment']
+
+                    # 交叉
+                    child1, child2 = self._crossover(parent1, parent2)
+
+                    # 变异
+                    child1 = self._mutate(child1)
+                    child2 = self._mutate(child2)
+
+                    # 计算目标函数
+                    obj1 = self._calculate_objectives(child1)
+                    obj2 = self._calculate_objectives(child2)
+
+                    offspring.extend([
+                        {'assignment': child1, 'objectives': obj1, 'rank': 0, 'crowding_distance': 0.0},
+                        {'assignment': child2, 'objectives': obj2, 'rank': 0, 'crowding_distance': 0.0}
+                    ])
+
+                # 合并父代和子代
+                self.population.extend(offspring[:self.population_size])
+
+                # 非支配排序
+                fronts = self._fast_non_dominated_sort()
+
+                # 环境选择
+                self._environmental_selection(fronts)
+
+        end_time = time.time()
+        runtime = end_time - start_time
+        print(f"\n距离限制使用情况:")
+        if self.use_dynamic_dmax:
+            print(f"  使用动态距离限制: {self.dynamic_dmax:.1f}米")
+            print(f"  原始固定限制: {self.dmax:.1f}米")
+            improvement = (self.dynamic_dmax - self.dmax) / self.dmax * 100
+            print(f"  调整幅度: {improvement:+.1f}%")
+        else:
+            print(f"  使用固定距离限制: {self.dmax:.1f}米")
+        print(f"\n算法运行完成，耗时 {runtime:.2f} 秒")
+        print(f"最终帕累托前沿包含 {len(self.pareto_front)} 个解")
+
+        return self.pareto_front
+
+    def visualize_results(self):
+        """可视化结果"""
+        if not self.pareto_front:
+            print("没有找到可行解")
+            return
+
+        # 创建图形
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+
+        # 1. 帕累托前沿
+        objectives = [ind['objectives'] for ind in self.pareto_front]
+        obj1_values = [obj[0] for obj in objectives]
+        obj2_values = [obj[1] for obj in objectives]
+
+        ax1.scatter(obj1_values, obj2_values, c='red', s=50, alpha=0.7)
+        ax1.set_xlabel('Total distance (p·m)')
+        ax1.set_ylabel('Total crossing times (p·times)')
+        ax1.set_title('Pareto front')
+        ax1.grid(True, alpha=0.3)
+
+        # 2. 收敛历史
+        ax2.plot(self.history['generation'], self.history['best_obj1'], 'b-', label='Best distance')
+        ax2_twin = ax2.twinx()
+        ax2_twin.plot(self.history['generation'], self.history['best_obj2'], 'r-', label='Best crossing')
+        ax2.set_xlabel('Iteration count')  # 迭代次数
+        ax2.set_ylabel('Best distance', color='b')
+        ax2_twin.set_ylabel('Best crossing', color='r')
+        ax2.set_title('Convergence history')  # 收敛历史
+        ax2.grid(True, alpha=0.3)
+
+        # 3. 帕累托前沿大小变化
+        ax3.plot(self.history['generation'], self.history['pareto_size'], 'g-')
+        ax3.set_xlabel('Iteration count')
+        ax3.set_ylabel('Pareto front size')
+        ax3.set_title('Pareto front size changes')
+        ax3.grid(True, alpha=0.3)
+
+        # 4. 分配方案示例（选择一个代表性解）
+        if len(self.pareto_front) > 0:
+            # 选择最平衡的解（归一化后距离原点最近）
+            normalized_obj1 = np.array(obj1_values) / max(obj1_values)
+            normalized_obj2 = np.array(obj2_values) / max(obj2_values)
+            distances = np.sqrt(normalized_obj1 ** 2 + normalized_obj2 ** 2)
+            best_idx = np.argmin(distances)
+            best_solution = self.pareto_front[best_idx]
+            assignment = best_solution['assignment']
+
+            # 创建分配表
+            allocation_data = []
+            for i in range(self.num_demands):
+                j = assignment[i]
+                if j != -1:
+                    allocation_data.append([
+                        f"Demand point {i + 1}",
+                        f"Gathering point {j + 1}",
+                        self.demands[i],
+                        f"{self.distance_matrix[i, j]:.1f}",
+                        f"{self.crossing_matrix[i, j]:.0f}"
+                    ])
+
+            df = pd.DataFrame(allocation_data,
+                              columns=['DPs', 'GPs', 'Demands(people)', 'Distance(m)', 'Crossing times'])
+
+            # 显示表格
+            ax4.axis('tight')
+            ax4.axis('off')
+            table = ax4.table(cellText=df.values,
+                              colLabels=df.columns,
+                              cellLoc='center',
+                              loc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1.2, 1.5)
+            ax4.set_title(
+                f'Best arrangement:\nDistance: {best_solution["objectives"][0]:.1f}, Crossing: {best_solution["objectives"][1]:.1f}')
+
+        plt.tight_layout()
+        plt.show()
+
+    def export_results(self, filename: str = "pareto_solutions.csv"):
+        """导出帕累托最优解到CSV文件"""
+        if not self.pareto_front:
+            print("没有找到可行解")
+            return
+
+        results = []
+        for idx, solution in enumerate(self.pareto_front):
+            assignment = solution['assignment']
+            obj1, obj2 = solution['objectives']
+
+            # 计算分配统计
+            allocated_demands = np.sum(assignment != -1)
+            total_allocated_demand = np.sum(self.demands[assignment != -1])
+
+            # 计算集合点利用率
+            utilization = []
+            for j in range(self.num_gathering):
+                used_capacity = np.sum(self.demands[assignment == j])
+                util_rate = used_capacity / self.capacities[j] if self.capacities[j] > 0 else 0
+                utilization.append(util_rate)
+
+            avg_utilization = np.mean(utilization)
+            results.append({
+                'solution_id': idx + 1,
+                'total_distance': obj1,
+                'total_crossings': obj2,
+                'allocated_demands': allocated_demands,
+                'total_allocated_demand': total_allocated_demand,
+                'avg_utilization': avg_utilization,
+                'assignment': assignment.tolist()
+            })
+
+        df = pd.DataFrame(results)
+        df.to_csv(filename, index=False)
+        print(f"帕累托最优解已导出到 {filename}")
+
+
+def run_optimization(road_network_selector):
+    """
+    运行优化算法的主函数
+
+    Args:
+        road_network_selector: RoadNetworkSelector实例
+    """
+    try:
+        # 创建遗传算法实例
+        ga = MultiObjectiveGA(
+            road_network=road_network_selector,
+            population_size=100,
+            max_generations=200,
+            crossover_rate=0.8,
+            mutation_rate=0.1,
+            dmax=1500,
+            use_dynamic_dmax=True  # 启用动态距离限制
+        )
+
+        # 运行算法
+        pareto_solutions = ga.run()
+
+        # 可视化结果
+        ga.visualize_results()
+
+        # 导出结果
+        ga.export_results()
+
+        return ga, pareto_solutions
+
+    except Exception as e:
+        print(f"优化过程中出现错误: {e}")
+        return None, None
+
+if __name__ == "__main__":
+    print("双目标遗传算法模块")
+    print("请从主程序调用 run_optimization() 函数")
