@@ -10,6 +10,7 @@ import itertools
 import copy
 import pandas as pd
 import geopandas as gpd
+import json
 
 class RoadNetworkSelector:
     def __init__(self, location, dist=1000, location_name=""):
@@ -37,22 +38,51 @@ class RoadNetworkSelector:
         self.selecting = False
         self.temp_edge = []
         self._history = []  # 撤销历史栈
+        self.disaster_data = {}  # 存储灾害数据
+        self.disaster_visible = {
+            'Tsunami': False,
+            'Landslide': False,
+            'Flood': False
+        }
+        self.load_disaster_data()  # 加载灾害数据
         self.fig, self.ax = plt.subplots(figsize=(12, 10))
         plt.subplots_adjust(left=0.12, right=0.88, bottom=0.15, top=0.9)
         self._init_view = None
-        self.hazard_layers = {}  # 存储不同类型的灾害地图，键为hazard_type，值为GeoDataFrame
-        self.show_hazards = {}  # 控制各灾害类型的显示状态，默认为False
-        self.hazard_colors = {  # 定义灾害类型颜色
-            'flood': 'blue',
-            'tsunami': 'cyan',
-            'earthquake': 'red',
-            'landslide': 'orange'
-        }
         self.add_buttons()
         self.draw_map(preserve_view=False)
         self.connect_events()
         plt.show()
 
+    def load_disaster_data(self):
+        """从data/目录加载灾害GeoJSON文件"""
+        disaster_files = {
+            'Tsunami': 'data/Tsunami.geojson',
+            'Landslide': 'data/Landslide.geojson',
+            'Flood': 'data/Flood.geojson'
+        }
+
+        for disaster_type, filepath in disaster_files.items():
+            try:
+                # 尝试加载GeoJSON文件
+                gdf = gpd.read_file(filepath)
+
+                # 转换坐标系统以匹配地图
+                if not gdf.crs:
+                    print(f"警告: {disaster_type} 文件没有坐标系统信息，假定为 EPSG:4326")
+                    gdf = gdf.set_crs("EPSG:4326")
+
+                # 转换到与路网相同的投影坐标系
+                if hasattr(self, 'nodes') and self.nodes.crs:
+                    gdf = gdf.to_crs(self.nodes.crs)
+
+                self.disaster_data[disaster_type] = gdf
+                print(f"成功加载 {disaster_type} 数据: {len(gdf)} 个要素")
+            except FileNotFoundError:
+                print(f"警告: 未找到文件 {filepath}")
+                self.disaster_data[disaster_type] = None
+            except Exception as e:
+                print(f"加载 {disaster_type} 时出错: {e}")
+                self.disaster_data[disaster_type] = None
     def add_buttons(self):
         # 按钮宽高
         button_width = 0.11
@@ -112,9 +142,24 @@ class RoadNetworkSelector:
         self.btn_optimize = Button(ax_optimize, 'Optimize')
         self.btn_optimize.on_clicked(self.run_optimization)
 
-        ax_hazard = plt.axes([0.015, left_base, button_width, button_height])
-        self.btn_hazard = Button(ax_hazard, 'Load Hazard')
-        self.btn_hazard.on_clicked(self.load_hazard_map)
+        disaster_button_width = 0.08
+        disaster_button_height = 0.05
+        disaster_y_position = 0.92
+        disaster_start_x = 0.35
+
+        ax_tsunami = plt.axes([disaster_start_x, disaster_y_position, disaster_button_width, disaster_button_height])
+        self.btn_tsunami = Button(ax_tsunami, 'Tsunami')
+        self.btn_tsunami.on_clicked(self.toggle_tsunami)
+
+        ax_landslide = plt.axes(
+            [disaster_start_x + 0.10, disaster_y_position, disaster_button_width, disaster_button_height])
+        self.btn_landslide = Button(ax_landslide, 'Landslide')
+        self.btn_landslide.on_clicked(self.toggle_landslide)
+
+        ax_flood = plt.axes(
+            [disaster_start_x + 0.20, disaster_y_position, disaster_button_width, disaster_button_height])
+        self.btn_flood = Button(ax_flood, 'Flood')
+        self.btn_flood.on_clicked(self.toggle_flood)
 
     def draw_map(self, preserve_view=True):
         if preserve_view:
@@ -126,10 +171,6 @@ class RoadNetworkSelector:
         else:
             xlim = ylim = None
         self.ax.clear()
-        for h_type, hazard_gdf in self.hazard_layers.items():
-            if self.show_hazards.get(h_type, False):
-                color = self.hazard_colors.get(h_type, 'gray')
-                hazard_gdf.plot(ax=self.ax, color=color, alpha=0.3, label=f'{h_type.capitalize()} Hazard')
         edges = self.edges.copy()
         edge_colors = ['grey'] * len(edges)  # 默认未选择道路为灰线
         edge_widths = [1] * len(edges)
@@ -153,9 +194,7 @@ class RoadNetworkSelector:
                 node_sizes[i] = 100
 
         self.nodes.plot(ax=self.ax, color=node_colors, markersize=node_sizes, alpha=0.8)
-        handles, labels = self.ax.get_legend_handles_labels()
-        if handles:
-            self.ax.legend(handles, labels, loc='upper right')
+        self.draw_disaster_layers()
         plt.suptitle(self.location_name, fontsize=16, y=0.98)
         # 模式提示标语
         if self.mode == 'nodes':
@@ -163,25 +202,21 @@ class RoadNetworkSelector:
             self.btn_toggle.label.set_text('Road Selection')
             self.btn_arterial.label.set_text('MainRoad Selection')
             self.btn_gathering.label.set_text('Gathering Points')
-            self.btn_hazard.label.set_text('Load Hazard')
         elif self.mode == 'edges':
             subtitle = 'Selection Mode: Roads - Click two nodes to select shortest path between them'
             self.btn_toggle.label.set_text('Node Selection')
             self.btn_arterial.label.set_text('MainRoad Selection')
             self.btn_gathering.label.set_text('Gathering Points')
-            self.btn_hazard.label.set_text('Load Hazard')
         elif self.mode == 'arterial':
             subtitle = 'Selection Mode: Arterial Roads - Click on roads to mark/unmark as arterial'
             self.btn_toggle.label.set_text('Node Selection')
             self.btn_arterial.label.set_text('Road Selection')
             self.btn_gathering.label.set_text('Gathering Points')
-            self.btn_hazard.label.set_text('Load Hazard')
         else:
             subtitle = 'Selection Mode: Gathering Points - Click on nodes to mark/unmark as gathering point P'
             self.btn_toggle.label.set_text('Node Selection')
             self.btn_arterial.label.set_text('MainRoad Selection')
             self.btn_gathering.label.set_text('Road Selection')
-            self.btn_hazard.label.set_text('Load Hazard')
         plt.title(subtitle, fontsize=12)
         self.ax.set_xlabel('Longitude')
         self.ax.set_ylabel('Latitude')
@@ -204,8 +239,38 @@ class RoadNetworkSelector:
 
         self.fig.canvas.draw_idle()  # 更新画布
 
+    def draw_disaster_layers(self):
+        """在地图上绘制灾害图层"""
+        disaster_colors = {
+            'Tsunami': 'blue',
+            'Landslide': 'brown',
+            'Flood': 'cyan'
+        }
 
-    # connect和onclick是配套的，主要负责光标的点击按钮和各个功能的联动
+        disaster_alphas = {
+            'Tsunami': 0.3,
+            'Landslide': 0.3,
+            'Flood': 0.25
+        }
+
+        for disaster_type in ['Tsunami', 'Landslide', 'Flood']:
+            if self.disaster_visible[disaster_type] and self.disaster_data.get(disaster_type) is not None:
+                gdf = self.disaster_data[disaster_type]
+                color = disaster_colors[disaster_type]
+                alpha = disaster_alphas[disaster_type]
+
+                # 绘制灾害区域
+                gdf.plot(
+                    ax=self.ax,
+                    color=color,
+                    alpha=alpha,
+                    edgecolor='darkred',
+                    linewidth=1.5,
+                    label=disaster_type
+                )
+
+                print(f"绘制 {disaster_type} 图层: {len(gdf)} 个区域")
+                
     def connect_events(self):
         self.cid_click = self.fig.canvas.mpl_connect('button_press_event', self.on_click)
 
@@ -244,7 +309,6 @@ class RoadNetworkSelector:
         self.temp_edge = []
         self.draw_map()
 
-
     def toggle_gathering(self, event):  # 在集合点选择模式和道路选择模式中切换
         if self.mode == 'gathering':
             self.mode = 'edges'
@@ -255,7 +319,26 @@ class RoadNetworkSelector:
         self.temp_edge = []
         self.draw_map()
 
+    def toggle_tsunami(self, event):
+        """切换海啸灾害显示"""
+        self.disaster_visible['Tsunami'] = not self.disaster_visible['Tsunami']
+        status = "显示" if self.disaster_visible['Tsunami'] else "隐藏"
+        print(f"海啸灾害图层: {status}")
+        self.draw_map()
 
+    def toggle_landslide(self, event):
+        """切换山体滑坡灾害显示"""
+        self.disaster_visible['Landslide'] = not self.disaster_visible['Landslide']
+        status = "显示" if self.disaster_visible['Landslide'] else "隐藏"
+        print(f"山体滑坡灾害图层: {status}")
+        self.draw_map()
+
+    def toggle_flood(self, event):
+        """切换洪水灾害显示"""
+        self.disaster_visible['Flood'] = not self.disaster_visible['Flood']
+        status = "显示" if self.disaster_visible['Flood'] else "隐藏"
+        print(f"洪水灾害图层: {status}")
+        self.draw_map()
     def zoom_in(self, event):
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
@@ -267,7 +350,6 @@ class RoadNetworkSelector:
         self.ax.set_xlim([xmid - xdelta, xmid + xdelta])
         self.ax.set_ylim([ymid - ydelta, ymid + ydelta])
         self.fig.canvas.draw_idle()
-
 
     def zoom_out(self, event):
         xlim = self.ax.get_xlim()
@@ -1513,37 +1595,6 @@ class RoadNetworkSelector:
 
                 print(f"需求点 {i + 1} (Node {demand_node}, 需求 {demand}) -> "
                       f"集合点 {j + 1} (Node {gathering_node}) : {distance:.1f}m")
-
-    def load_hazard_map(self, event):
-        """加载灾害地图，支持洪水、海啸、地震、泥石流等"""
-        hazard_types = ['flood', 'tsunami', 'earthquake', 'landslide']
-        print("Available hazard types: flood, tsunami, earthquake, landslide")
-        hazard_type = input("Enter hazard type to load (or 'toggle' to toggle display): ").strip().lower()
-        if hazard_type == 'toggle':
-            for h_type in hazard_types:
-                if h_type in self.show_hazards:
-                    self.show_hazards[h_type] = not self.show_hazards[h_type]
-                    print(f"Toggled {h_type} display: {'on' if self.show_hazards[h_type] else 'off'}")
-                else:
-                    print(f"No {h_type} data loaded yet.")
-            self.draw_map()
-            return
-        if hazard_type not in hazard_types:
-            print("Invalid hazard type.")
-            return
-        file_path = input(f"Enter file path for {hazard_type} hazard map (shp, geojson, etc.): ").strip()
-        if not file_path:
-            print("No file path provided.")
-            return
-        try:
-            hazard = gpd.read_file(file_path)
-            hazard = hazard.to_crs(self.edges.crs)  # 投影到与道路网络相同的坐标系
-            self.hazard_layers[hazard_type] = hazard
-            self.show_hazards[hazard_type] = True  # 默认加载后显示
-            print(f"Loaded {hazard_type} hazard map with {len(hazard)} features.")
-            self.draw_map()
-        except Exception as e:
-            print(f"Error loading hazard map: {e}")
 
 if __name__ == "__main__":
     selector = RoadNetworkSelector(
