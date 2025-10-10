@@ -54,34 +54,126 @@ class RoadNetworkSelector:
         plt.show()
 
     def load_disaster_data(self):
-        """从data/目录加载灾害GeoJSON文件"""
+        """从data/目录加载灾害文件（支持GeoJSON和Shapefile）"""
         disaster_files = {
-            'Tsunami': 'data/Tsunami.geojson',
-            'Landslide': 'data/Landslide.geojson',
-            'Flood': 'data/Flood.geojson'
+            'Tsunami': [
+                'data/A40-16_28.shp',  # Shapefile 格式
+            ],
+            'Landslide': [
+                'data/Landslide.geojson',
+            ],
+            'Flood': [
+                'data/Flood.geojson',
+            ]
         }
 
-        for disaster_type, filepath in disaster_files.items():
-            try:
-                # 尝试加载GeoJSON文件
-                gdf = gpd.read_file(filepath)
+        # 等待路网数据加载完成
+        if not hasattr(self, 'nodes') or self.nodes is None:
+            print("警告: 路网数据尚未加载")
+            for disaster_type in disaster_files.keys():
+                self.disaster_data[disaster_type] = None
+            return
 
-                # 转换坐标系统以匹配地图
+        print(f"\n路网坐标系: {self.nodes.crs}")
+        print(f"路网边界范围: {self.nodes.total_bounds}")
+
+        for disaster_type, filepaths in disaster_files.items():
+            gdf = None
+            loaded_file = None
+
+            # 尝试按顺序加载不同格式的文件
+            for filepath in filepaths:
+                try:
+                    print(f"\n尝试加载: {filepath}")
+
+                    if filepath.endswith('.shp'):
+                        # 加载 Shapefile（使用 shift-jis 编码）
+                        gdf = gpd.read_file(filepath, encoding='shift-jis')
+                        print(f"  ✓ 成功读取 {len(gdf)} 个要素")
+
+                        # 显示信息
+                        print(f"  几何类型: {list(gdf.geometry.type.unique())}")
+                        print(f"  属性字段: {list(gdf.columns)}")
+
+                        # 修复无效几何
+                        invalid_count = (~gdf.geometry.is_valid).sum()
+                        if invalid_count > 0:
+                            print(f"  修复 {invalid_count} 个无效几何...")
+                            gdf['geometry'] = gdf.geometry.buffer(0)
+
+                    elif filepath.endswith('.geojson'):
+                        gdf = gpd.read_file(filepath)
+
+                    if gdf is not None and len(gdf) > 0:
+                        loaded_file = filepath
+                        print(f"✓ 成功从 {filepath} 加载数据")
+                        break
+
+                except FileNotFoundError:
+                    print(f"  文件不存在: {filepath}")
+                    continue
+                except Exception as e:
+                    print(f"  加载失败: {e}")
+                    continue
+
+            # 如果成功加载了数据
+            if gdf is not None and len(gdf) > 0:
+                print(f"\n--- {disaster_type} 文件信息 ---")
+                print(f"加载的文件: {loaded_file}")
+                print(f"原始坐标系: {gdf.crs}")
+                print(f"要素数量: {len(gdf)}")
+                print(f"原始边界范围: {gdf.total_bounds}")
+
+                # 设置坐标系
                 if not gdf.crs:
                     print(f"警告: {disaster_type} 文件没有坐标系统信息，假定为 EPSG:4326")
-                    gdf = gdf.set_crs("EPSG:4326")
+                    gdf = gdf.set_crs("EPSG:4326", allow_override=True)
 
                 # 转换到与路网相同的投影坐标系
-                if hasattr(self, 'nodes') and self.nodes.crs:
+                if gdf.crs != self.nodes.crs:
+                    print(f"转换坐标系: {gdf.crs} → {self.nodes.crs}")
                     gdf = gdf.to_crs(self.nodes.crs)
+                    print(f"转换后边界范围: {gdf.total_bounds}")
+
+                # 检查是否与路网范围重叠
+                nodes_bounds = self.nodes.total_bounds
+                disaster_bounds = gdf.total_bounds
+
+                overlap_x = not (disaster_bounds[2] < nodes_bounds[0] or disaster_bounds[0] > nodes_bounds[2])
+                overlap_y = not (disaster_bounds[3] < nodes_bounds[1] or disaster_bounds[1] > nodes_bounds[3])
+
+                if overlap_x and overlap_y:
+                    print(f"✓ {disaster_type} 数据与路网范围有重叠")
+
+                    # 裁剪到路网范围（添加缓冲区）
+                    from shapely.geometry import box
+                    buffer = 1000  # 1公里缓冲区
+
+                    clip_box = box(
+                        nodes_bounds[0] - buffer,
+                        nodes_bounds[1] - buffer,
+                        nodes_bounds[2] + buffer,
+                        nodes_bounds[3] + buffer
+                    )
+
+                    original_count = len(gdf)
+                    gdf = gdf[gdf.intersects(clip_box)].copy()
+
+                    if len(gdf) < original_count:
+                        print(f"  裁剪到研究区域: {original_count} → {len(gdf)} 个要素")
+
+                else:
+                    print(f"⚠ 警告: {disaster_type} 数据与路网范围不重叠")
+                    print(
+                        f"   路网范围: X[{nodes_bounds[0]:.0f}, {nodes_bounds[2]:.0f}], Y[{nodes_bounds[1]:.0f}, {nodes_bounds[3]:.0f}]")
+                    print(
+                        f"   灾害范围: X[{disaster_bounds[0]:.0f}, {disaster_bounds[2]:.0f}], Y[{disaster_bounds[1]:.0f}, {disaster_bounds[3]:.0f}]")
+                    print(f"   建议增大路网的 dist 参数")
 
                 self.disaster_data[disaster_type] = gdf
-                print(f"成功加载 {disaster_type} 数据: {len(gdf)} 个要素")
-            except FileNotFoundError:
-                print(f"警告: 未找到文件 {filepath}")
-                self.disaster_data[disaster_type] = None
-            except Exception as e:
-                print(f"加载 {disaster_type} 时出错: {e}")
+                print(f"✓ 成功加载 {disaster_type} 数据")
+            else:
+                print(f"✗ 未能加载 {disaster_type} 数据")
                 self.disaster_data[disaster_type] = None
     def add_buttons(self):
         # 按钮宽高
@@ -242,15 +334,27 @@ class RoadNetworkSelector:
     def draw_disaster_layers(self):
         """在地图上绘制灾害图层"""
         disaster_colors = {
-            'Tsunami': 'blue',
+            'Tsunami': 'red',
             'Landslide': 'brown',
             'Flood': 'cyan'
         }
 
         disaster_alphas = {
-            'Tsunami': 0.3,
+            'Tsunami': 0.5,  # 透明度
             'Landslide': 0.3,
             'Flood': 0.25
+        }
+
+        disaster_edge_colors = {
+            'Tsunami': 'darkred',  # 边框颜色
+            'Landslide': 'darkred',
+            'Flood': 'darkblue'
+        }
+
+        disaster_edge_widths = {
+            'Tsunami': 0.5,  # 边框宽度
+            'Landslide': 1.5,
+            'Flood': 1.0
         }
 
         for disaster_type in ['Tsunami', 'Landslide', 'Flood']:
@@ -258,18 +362,20 @@ class RoadNetworkSelector:
                 gdf = self.disaster_data[disaster_type]
                 color = disaster_colors[disaster_type]
                 alpha = disaster_alphas[disaster_type]
+                edge_color = disaster_edge_colors[disaster_type]
+                edge_width = disaster_edge_widths[disaster_type]
 
                 # 绘制灾害区域
                 gdf.plot(
                     ax=self.ax,
                     color=color,
                     alpha=alpha,
-                    edgecolor='darkred',
-                    linewidth=1.5,
-                    label=disaster_type
+                    edgecolor=edge_color,
+                    linewidth=edge_width,
+                    zorder=10  # 确保在最上层显示
                 )
 
-                print(f"绘制 {disaster_type} 图层: {len(gdf)} 个区域")
+                print(f"✓ 绘制 {disaster_type} 图层: {len(gdf)} 个区域")
                 
     def connect_events(self):
         self.cid_click = self.fig.canvas.mpl_connect('button_press_event', self.on_click)
@@ -1598,7 +1704,7 @@ class RoadNetworkSelector:
 
 if __name__ == "__main__":
     selector = RoadNetworkSelector(
-        location=(34.722722, 135.2913111),
-        dist=1500,
-        location_name="Kobe Fukae"
+        location=(34.6937, 135.1955),
+        dist=2000,
+        location_name="Sannomiya"
     )
