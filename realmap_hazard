@@ -37,14 +37,19 @@ class RoadNetworkSelector:
         self.mode = 'nodes'
         self.selecting = False
         self.temp_edge = []
-        self._history = []  # 撤销历史栈
-        self.disaster_data = {}  # 存储灾害数据
+        self._history = []
+        self.disaster_data = {}
         self.disaster_visible = {
             'Tsunami': False,
             'Landslide': False,
             'Flood': False
         }
-        self.load_disaster_data()  # 加载灾害数据
+        self.is_dragging = False
+        self.drag_start_x = None
+        self.drag_start_y = None
+        self.drag_xlim_start = None
+        self.drag_ylim_start = None
+        self.load_disaster_data()
         self.fig, self.ax = plt.subplots(figsize=(12, 10))
         plt.subplots_adjust(left=0.12, right=0.88, bottom=0.15, top=0.9)
         self._init_view = None
@@ -275,17 +280,26 @@ class RoadNetworkSelector:
                     edge_colors[i] = 'blue'
                     edge_widths[i] = 3
         edges.plot(ax=self.ax, color=edge_colors, linewidth=edge_widths, alpha=0.7)
-        node_colors = ['lightgrey'] * len(self.nodes)
-        node_sizes = [30] * len(self.nodes)
-        for i, node_id in enumerate(self.nodes.index):  # 标注普通道路节点和集合点
-            if node_id in self.gathering_points:
-                node_colors[i] = 'green'
-                node_sizes[i] = 120
-            elif node_id in self.selected_nodes:
-                node_colors[i] = 'red'
-                node_sizes[i] = 100
+        selected_or_gathering_nodes = []
+        node_colors = []
+        node_sizes = []
 
-        self.nodes.plot(ax=self.ax, color=node_colors, markersize=node_sizes, alpha=0.8)
+        for node_id in self.nodes.index:
+            if node_id in self.gathering_points:
+                selected_or_gathering_nodes.append(node_id)
+                node_colors.append('green')
+                node_sizes.append(120)
+            elif node_id in self.selected_nodes:
+                selected_or_gathering_nodes.append(node_id)
+                node_colors.append('red')
+                node_sizes.append(100)
+        if selected_or_gathering_nodes:
+            self.nodes.loc[selected_or_gathering_nodes].plot(
+                ax=self.ax,
+                color=node_colors,
+                markersize=node_sizes,
+                alpha=0.8
+            )
         self.draw_disaster_layers()
         plt.suptitle(self.location_name, fontsize=16, y=0.98)
         # 模式提示标语
@@ -376,24 +390,84 @@ class RoadNetworkSelector:
                 )
 
                 print(f"✓ 绘制 {disaster_type} 图层: {len(gdf)} 个区域")
-                
+
     def connect_events(self):
         self.cid_click = self.fig.canvas.mpl_connect('button_press_event', self.on_click)
-
+        self.cid_release = self.fig.canvas.mpl_connect('button_release_event', self.on_release)
+        self.cid_motion = self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
 
     def on_click(self, event):
         if event.inaxes != self.ax:
             return
-        if self.mode == 'nodes':
-            self.select_node(event)
-        elif self.mode == 'edges':
-            self.select_edge(event)
-        elif self.mode == 'arterial':
-            self.select_arterial(event)
-        else:
-            self.select_gathering_point(event)
 
+        if event.button == 3:  # 右键
+            self.is_dragging = True
+            self.drag_start_x = event.xdata
+            self.drag_start_y = event.ydata
+            self.drag_xlim_start = self.ax.get_xlim()
+            self.drag_ylim_start = self.ax.get_ylim()
+            return
 
+        if event.button == 1:  # 左键
+            if self.mode == 'nodes':
+                self.select_node(event)
+            elif self.mode == 'edges':
+                self.select_edge(event)
+            elif self.mode == 'arterial':
+                self.select_arterial(event)
+            else:
+                self.select_gathering_point(event)
+
+    def on_release(self, event):
+        """鼠标释放时停止拖动"""
+        if event.button == 3:  # 右键释放
+            self.is_dragging = False
+            self.drag_start_x = None
+            self.drag_start_y = None
+            self.drag_xlim_start = None
+            self.drag_ylim_start = None
+
+    def on_motion(self, event):
+        """鼠标移动时拖动地图（限制在初始边界范围内）"""
+        if not self.is_dragging or event.xdata is None or event.ydata is None:
+            return
+
+        if event.inaxes != self.ax:
+            return
+
+        # 计算拖动偏移量
+        dx = self.drag_start_x - event.xdata
+        dy = self.drag_start_y - event.ydata
+
+        # 计算新的视图范围
+        new_xlim = (self.drag_xlim_start[0] + dx, self.drag_xlim_start[1] + dx)
+        new_ylim = (self.drag_ylim_start[0] + dy, self.drag_ylim_start[1] + dy)
+
+        # 获取初始边界范围
+        if hasattr(self, '_init_view') and self._init_view is not None:
+            init_xlim, init_ylim = self._init_view
+
+            # 限制拖动范围不超过初始边界
+            # X轴限制
+            if new_xlim[0] < init_xlim[0]:
+                offset = init_xlim[0] - new_xlim[0]
+                new_xlim = (new_xlim[0] + offset, new_xlim[1] + offset)
+            if new_xlim[1] > init_xlim[1]:
+                offset = new_xlim[1] - init_xlim[1]
+                new_xlim = (new_xlim[0] - offset, new_xlim[1] - offset)
+
+            # Y轴限制
+            if new_ylim[0] < init_ylim[0]:
+                offset = init_ylim[0] - new_ylim[0]
+                new_ylim = (new_ylim[0] + offset, new_ylim[1] + offset)
+            if new_ylim[1] > init_ylim[1]:
+                offset = new_ylim[1] - init_ylim[1]
+                new_ylim = (new_ylim[0] - offset, new_ylim[1] - offset)
+
+        self.ax.set_xlim(new_xlim)
+        self.ax.set_ylim(new_ylim)
+        self.fig.canvas.draw_idle()
+        
     def toggle_mode(self, event):  # 在节点模式和道路选择模式中切换
         if self.mode == 'nodes':
             self.mode = 'edges'
