@@ -12,6 +12,7 @@ import pandas as pd
 import geopandas as gpd
 import json
 
+
 class RoadNetworkSelector:
     def __init__(self, location, dist=1000, location_name=""):
         self.location_name = location_name if location_name else "Selected Area"
@@ -467,7 +468,7 @@ class RoadNetworkSelector:
         self.ax.set_xlim(new_xlim)
         self.ax.set_ylim(new_ylim)
         self.fig.canvas.draw_idle()
-        
+
     def toggle_mode(self, event):  # 在节点模式和道路选择模式中切换
         if self.mode == 'nodes':
             self.mode = 'edges'
@@ -661,11 +662,19 @@ class RoadNetworkSelector:
                     self.selected_path_nodes.update(path_set)
                     for i in range(len(path) - 1):
                         u, v = path[i], path[i + 1]
+                        # 先尝试正向边 u->v
                         if self.original_G.has_edge(u, v):
                             for k in self.original_G.get_edge_data(u, v).keys():
                                 self.selected_edges.add((u, v, k))
                                 print(f"添加边: ({u}, {v}, {k})")
-                    print(f"Edge from{start_node} to {end_node} has been selected")
+                        # 如果没有正向边，尝试反向边 v->u
+                        elif self.original_G.has_edge(v, u):
+                            for k in self.original_G.get_edge_data(v, u).keys():
+                                self.selected_edges.add((v, u, k))
+                                print(f"添加边（反向）: ({v}, {u}, {k})")
+                        else:
+                            print(f"警告：边 ({u}, {v}) 双向都不存在")
+                    print(f"Edge from {start_node} to {end_node} has been selected")
                 self.temp_edge = []
             self.draw_map()
 
@@ -702,20 +711,32 @@ class RoadNetworkSelector:
                     self.selected_path_nodes.update(path_set)
                     for i in range(len(path) - 1):
                         u, v = path[i], path[i + 1]
+                        # 先尝试正向边 u->v
                         if self.original_G.has_edge(u, v):
                             for k in self.original_G.get_edge_data(u, v).keys():
                                 self.selected_edges.add((u, v, k))
                                 self.arterial_edges.add((u, v, k))
-                self.temp_edge = []
+                        # 如果没有正向边，尝试反向边 v->u
+                        elif self.original_G.has_edge(v, u):
+                            for k in self.original_G.get_edge_data(v, u).keys():
+                                self.selected_edges.add((v, u, k))
+                                self.arterial_edges.add((v, u, k))
+                        else:
+                            print(f"警告：边 ({u}, {v}) 双向都不存在")
+                    self.temp_edge = []
             self.draw_map()
 
-
     def find_shortest_path(self, start_node, end_node):
+        """
+        使用无向图寻找最短路径，但返回的路径节点序列
+        """
         try:
-            path = nx.shortest_path(self.original_G, start_node, end_node, weight='length')
+            # 创建临时无向图用于路径搜索
+            G_undirected = self.original_G.to_undirected()
+            path = nx.shortest_path(G_undirected, start_node, end_node, weight='length')
             return path
         except nx.NetworkXNoPath:
-            print(f"There is NO edge from node {start_node} to {end_node}")
+            print(f"There is NO path from node {start_node} to {end_node}")
             return None
 
 
