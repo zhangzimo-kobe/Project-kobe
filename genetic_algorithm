@@ -216,45 +216,42 @@ class MultiObjectiveGA:
         return True
 
     def _generate_random_individual(self) -> np.ndarray:
-        """
-        生成一个随机的可行个体
+    """
+    生成一个随机的可行个体（纯随机方法，标准NSGA-II）
 
-        Returns:
-            np.ndarray: 分配方案
-        """
-        max_attempts = 1000
+    Returns:
+        np.ndarray: 分配方案
+    """
+    while True:  # 持续尝试直到生成可行解
+        assignment = np.full(self.num_demands, -1)
+        
+        # 随机排列需求点顺序
+        demand_order = np.random.permutation(self.num_demands)
 
-        for attempt in range(max_attempts):
-            assignment = np.full(self.num_demands, -1)
+        success = True
+        for i in demand_order:
+            # 找到可行的集合点
+            feasible_gatherings = []
+            for j in range(self.num_gathering):
+                # 检查距离约束
+                if self.distance_matrix[i, j] <= self.dynamic_dmax:
+                    # 检查容量约束
+                    current_load = np.sum(self.demands[assignment == j])
+                    if current_load + self.demands[i] <= self.capacities[j]:
+                        feasible_gatherings.append(j)
 
-            # 随机排列需求点顺序
-            demand_order = np.random.permutation(self.num_demands)
-
-            for i in demand_order:
-                # 找到可行的集合点
-                feasible_gatherings = []
-                for j in range(self.num_gathering):
-                    # 检查距离约束
-                    if self.distance_matrix[i, j] <= self.dynamic_dmax:
-                        # 检查容量约束
-                        current_load = np.sum(self.demands[assignment == j])
-                        if current_load + self.demands[i] <= self.capacities[j]:
-                            feasible_gatherings.append(j)
-
-                if feasible_gatherings:
-                    # 随机选择一个可行集合点
-                    j = random.choice(feasible_gatherings)
-                    assignment[i] = j
-                else:
-                    # 无可行分配，重新开始
-                    break
+            if feasible_gatherings:
+                # 随机选择一个可行集合点
+                j = random.choice(feasible_gatherings)
+                assignment[i] = j
             else:
-                # 所有需求点都成功分配
-                if np.all(assignment != -1):
-                    return assignment
-
-        # 如果无法生成可行解，使用贪心方法
-        return self._generate_greedy_individual()
+                # 无可行分配，重新开始
+                success = False
+                break
+        
+        # 如果所有需求点都成功分配，返回
+        if success and np.all(assignment != -1):
+            return assignment
 
     def _generate_greedy_individual(self) -> np.ndarray:
         """
