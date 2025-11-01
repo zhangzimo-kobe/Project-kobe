@@ -7,24 +7,25 @@ import pandas as pd
 from typing import List, Tuple, Dict, Optional
 import time
 
-
 class MultiObjectiveGA:
     def __init__(self, road_network,
                  population_size: int = 100,
                  max_generations: int = 200,
                  crossover_rate: float = 0.8,
                  mutation_rate: float = 0.1,
-                 dmax: float = 1500,
-                 use_dynamic_dmax: bool = True
+                 terrain_type: str = 'flat',
+                 elevation_factor: float = 1.0,
+                 road_condition_factor: float = 1.0
                  ):
         self.road_network = road_network
         self.population_size = population_size
         self.max_generations = max_generations
         self.crossover_rate = crossover_rate
         self.mutation_rate = mutation_rate
-        self.dmax = dmax
-        self.use_dynamic_dmax = use_dynamic_dmax
-        self.dynamic_dmax = dmax
+        self.terrain_type = terrain_type
+        self.elevation_factor = elevation_factor
+        self.road_condition_factor = road_condition_factor
+        self.dmax = self._calculate_terrain_based_dmax()
 
         # 提取问题数据
         self._extract_problem_data()
@@ -78,17 +79,7 @@ class MultiObjectiveGA:
         self.capacities = np.array([self.road_network.gathering_point_capacities.get(num, 0)
                                     for num in self.gathering_numbers])
 
-        # 提取距离矩阵
-        distance_df = self.road_network.distance_matrix
-        self.distance_matrix = np.full((self.num_demands, self.num_gathering), np.inf)
-        for i, demand_node in enumerate(self.demand_nodes):
-            for j, gp_num in enumerate(self.gathering_numbers):
-                if demand_node in distance_df.index and gp_num in distance_df.columns:
-                    distance = distance_df.loc[demand_node, gp_num]
-                    if not np.isinf(distance) and distance <= self.dmax:
-                        self.distance_matrix[i, j] = distance
-
-        # 提取距离矩阵（先用原始dmax）
+        # 提取距离矩阵（使用基于地形的距离限制）
         distance_df = self.road_network.distance_matrix
         self.distance_matrix = np.full((self.num_demands, self.num_gathering), np.inf)
         for i, demand_node in enumerate(self.demand_nodes):
@@ -98,23 +89,7 @@ class MultiObjectiveGA:
                     if not np.isinf(distance) and distance <= self.dmax:
                         self.distance_matrix[i, j] = distance
 
-        # 计算动态距离限制
-        if self.use_dynamic_dmax:
-            self.dynamic_dmax = self.calculate_dynamic_dmax()
-
-            # 重新构建距离矩阵（使用动态dmax）
-            self.distance_matrix = np.full((self.num_demands, self.num_gathering), np.inf)
-            for i, demand_node in enumerate(self.demand_nodes):
-                for j, gathering_node in enumerate(self.gathering_nodes):
-                    if demand_node in distance_df.index and gathering_node in distance_df.columns:
-                        distance = distance_df.loc[demand_node, gathering_node]
-                        if not np.isinf(distance) and distance <= self.dynamic_dmax:
-                            self.distance_matrix[i, j] = distance
-
-            print(f"使用动态距离限制重构距离矩阵完成")
-        else:
-            self.dynamic_dmax = self.dmax
-            print(f"使用固定距离限制: {self.dmax:.1f}米")
+        print(f"Distance matrix construction complete, using distance limit: {self.dmax:.1f}m")
 
         # 提取穿越次数矩阵
         self.crossing_matrix = self._get_crossing_matrix()
@@ -126,56 +101,39 @@ class MultiObjectiveGA:
         print(f"  Total Demands: {np.sum(self.demands)}")
         print(f"  Total Capacity: {np.sum(self.capacities)}")
 
-    def calculate_dynamic_dmax(self):
-        """根据路网特征动态计算最大距离限制"""
-        if self.distance_matrix is None:
-            print("警告：距离矩阵为空，使用固定dmax值")
-            return self.dmax
 
-        # 获取所有有效距离
-        valid_distances = []
-        for i in range(self.num_demands):
-            for j in range(self.num_gathering):
-                dist = self.distance_matrix[i, j]
-                if not np.isinf(dist) and not np.isnan(dist):
-                    valid_distances.append(dist)
+    def _calculate_terrain_based_dmax(self) -> float:
+        """
+        根据地形类型、海拔和路况计算距离限制
 
-        if not valid_distances:
-            print("警告：没有找到有效距离，使用固定dmax值")
-            return self.dmax
+        Returns:
+            float: 计算后的距离限制
+        """
+        # 地形类型基础距离（米）
+        terrain_base_distances = {
+            'flat': 1500,  # 平原：1500米
+            'hilly': 1200,  # 丘陵：1200米
+        '   mountainous': 900  # 山区：900米
+        }
 
-        valid_distances = np.array(valid_distances)
+        # 获取地形基础距离
+        base_distance = terrain_base_distances.get(self.terrain_type, 1500)
 
-        # 计算统计量
-        mean_dist = np.mean(valid_distances)
-        std_dist = np.std(valid_distances)
-        percentile_90 = np.percentile(valid_distances, 90)
-        percentile_75 = np.percentile(valid_distances, 75)
+        # 应用海拔和路况调整
+        adjusted_distance = base_distance * self.elevation_factor * self.road_condition_factor
 
-        # 动态计算dmax（使用多种策略的最小值）
-        strategy_1 = mean_dist + 1.5 * std_dist  # 统计学方法
-        strategy_2 = percentile_90  # 90分位数方法
-        strategy_3 = percentile_75 * 1.3  # 75分位数*1.3
-        strategy_4 = self.dmax * 1.2  # 不超过原限制的1.2倍
+        # 限制在合理范围内（500-2000米）
+        adjusted_distance = max(500, min(adjusted_distance, 2000))
 
-        dynamic_dmax = min(strategy_1, strategy_2, strategy_3, strategy_4)
+        print(f"\nTerrain-based distance limit calculation:")
+        print(f"  Terrain type: {self.terrain_type}")
+        print(f"  Base distance: {base_distance:.1f}m")
+        print(f"  Elevation factor: {self.elevation_factor}")
+        print(f"  Road condition factor: {self.road_condition_factor}")
+        print(f"  Final distance limit: {adjusted_distance:.1f}m")
 
-        # 确保不小于最短距离的1.5倍
-        min_dist = np.min(valid_distances)
-        dynamic_dmax = max(dynamic_dmax, min_dist * 1.5)
+        return adjusted_distance
 
-        print(f"动态距离限制计算结果:")
-        print(f"  平均距离: {mean_dist:.1f}米")
-        print(f"  标准差: {std_dist:.1f}米")
-        print(f"  90分位数: {percentile_90:.1f}米")
-        print(f"  75分位数: {percentile_75:.1f}米")
-        print(f"  策略1(均值+1.5σ): {strategy_1:.1f}米")
-        print(f"  策略2(90分位数): {strategy_2:.1f}米")
-        print(f"  策略3(75分位数*1.3): {strategy_3:.1f}米")
-        print(f"  策略4(原限制*1.2): {strategy_4:.1f}米")
-        print(f"  最终动态dmax: {dynamic_dmax:.1f}米 (原固定值: {self.dmax:.1f}米)")
-
-        return dynamic_dmax
 
     def _get_crossing_matrix(self):
         """获取穿越次数矩阵"""
@@ -205,7 +163,7 @@ class MultiObjectiveGA:
         # 检查距离约束
         for i in range(self.num_demands):
             j = assignment[i]
-            if j != -1 and self.distance_matrix[i, j] > self.dynamic_dmax:
+            if j != -1 and self.distance_matrix[i, j] > self.dmax:
                 return False
 
         return True
@@ -229,7 +187,7 @@ class MultiObjectiveGA:
                 feasible_gatherings = []
                 for j in range(self.num_gathering):
                     # 检查距离约束
-                    if self.distance_matrix[i, j] <= self.dynamic_dmax:
+                    if self.distance_matrix[i, j] <= self.dmax:
                         # 检查容量约束
                         current_load = np.sum(self.demands[assignment == j])
                         if current_load + self.demands[i] <= self.capacities[j]:
@@ -415,7 +373,7 @@ class MultiObjectiveGA:
         # 找到可行的集合点
         feasible_gatherings = []
         for j in range(self.num_gathering):
-            if j != mutated[i] and self.distance_matrix[i, j] <= self.dynamic_dmax:
+            if j != mutated[i] and self.distance_matrix[i, j] <= self.dmax:
                 # 检查容量约束
                 current_load = np.sum(self.demands[mutated == j])
                 if current_load + self.demands[i] <= self.capacities[j]:
@@ -454,7 +412,7 @@ class MultiObjectiveGA:
     def _find_feasible_gathering(self, demand_idx: int, current_assignment: np.ndarray) -> int:
         """为需求点找到可行的集合点"""
         for j in range(self.num_gathering):
-            if (self.distance_matrix[demand_idx, j] <= self.dynamic_dmax and
+            if (self.distance_matrix[demand_idx, j] <= self.dmax and
                     np.sum(self.demands[current_assignment == j]) + self.demands[demand_idx] <= self.capacities[j]):
                 return j
         return -1  # 无可行分配
@@ -586,14 +544,7 @@ class MultiObjectiveGA:
 
         end_time = time.time()
         runtime = end_time - start_time
-        print(f"\n距离限制使用情况:")
-        if self.use_dynamic_dmax:
-            print(f"  使用动态距离限制: {self.dynamic_dmax:.1f}米")
-            print(f"  原始固定限制: {self.dmax:.1f}米")
-            improvement = (self.dynamic_dmax - self.dmax) / self.dmax * 100
-            print(f"  调整幅度: {improvement:+.1f}%")
-        else:
-            print(f"  使用固定距离限制: {self.dmax:.1f}米")
+        print(f"\nDistance limit: {self.dmax:.1f}m (Terrain type: {self.terrain_type})")
         print(f"\n算法运行完成，耗时 {runtime:.2f} 秒")
         print(f"最终帕累托前沿包含 {len(self.pareto_front)} 个解")
         print(f"\n" + "帕累托最优解详情（共 {len(self.pareto_front)} 个解）")
@@ -736,12 +687,17 @@ class MultiObjectiveGA:
         df.to_csv(filename, index=False)
         print(f"帕累托最优解已导出到 {filename}")
 
-def run_optimization(road_network_selector):
+def run_optimization(road_network_selector,
+                    terrain_type='flat',    #在这里调整地形类别：flat/hilly/mountainous
+                    elevation_factor=1.0,   # 在这里微调地形参数
+                    road_condition_factor=1.0):    # 在这里微调道路参数
     """
     运行优化算法的主函数
-
     Args:
         road_network_selector: RoadNetworkSelector实例
+        terrain_type: 地形类型 ('flat'=平原, 'hilly'=丘陵, 'mountainous'=山区)
+        elevation_factor: 海拔影响因子 (0.5-2.0, 值越小距离限制越严格)
+        road_condition_factor: 路况影响因子 (0.5-2.0, 值越小距离限制越严格)
     """
     try:
         # 创建遗传算法实例
@@ -751,8 +707,9 @@ def run_optimization(road_network_selector):
             max_generations=200,
             crossover_rate=0.8,
             mutation_rate=0.1,
-            dmax=1500,
-            use_dynamic_dmax=True  # 启用动态距离限制
+            terrain_type=terrain_type,
+            elevation_factor=elevation_factor,
+            road_condition_factor=road_condition_factor
         )
 
         # 运行算法
