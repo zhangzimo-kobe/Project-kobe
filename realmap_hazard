@@ -12,6 +12,7 @@ import pandas as pd
 import geopandas as gpd
 import json
 
+
 class RoadNetworkSelector:
     def __init__(self, location, dist=1000, location_name=""):
         self.location_name = location_name if location_name else "Selected Area"
@@ -26,31 +27,25 @@ class RoadNetworkSelector:
         self.crossing_matrix = None
         self.selected_edges = set()
         self.arterial_edges = set()
-        self.gathering_points = {}
-        self.gathering_point_capacities = {}
-        self.next_gp_number = 1
-        self.demand_quantities = {}
-        self.region_centroid_nodes = []
-        self.distance_matrix = None
-        self.shortest_paths = {}
-        self.crossing_graph = None
-        self.crossing_matrix = None
+        self.gathering_points = set()
+        self.gathering_point_capacities = dict()
+        self.demand_quantities = {}  # 存储各需求点的疏散需求量
+        self.region_centroid_nodes = []  # 存储小区形心节点（需求点）
+        self.distance_matrix = None  # 完整距离矩阵：形心 × 集合点
+        self.shortest_paths = {}  # 存储所有最短路径
+        self.crossing_graph = None  # 穿越次数连通图
+        self.crossing_matrix = None  # 穿越次数矩阵
         self.mode = 'nodes'
         self.selecting = False
         self.temp_edge = []
-        self._history = []
-        self.disaster_data = {}
+        self._history = []  # 撤销历史栈
+        self.disaster_data = {}  # 存储灾害数据
         self.disaster_visible = {
             'Tsunami': False,
             'Landslide': False,
             'Flood': False
         }
-        self.is_dragging = False
-        self.drag_start_x = None
-        self.drag_start_y = None
-        self.drag_xlim_start = None
-        self.drag_ylim_start = None
-        self.load_disaster_data()
+        self.load_disaster_data()  # 加载灾害数据
         self.fig, self.ax = plt.subplots(figsize=(12, 10))
         plt.subplots_adjust(left=0.12, right=0.88, bottom=0.15, top=0.9)
         self._init_view = None
@@ -181,6 +176,7 @@ class RoadNetworkSelector:
             else:
                 print(f"✗ 未能加载 {disaster_type} 数据")
                 self.disaster_data[disaster_type] = None
+
     def add_buttons(self):
         # 按钮宽高
         button_width = 0.11
@@ -281,29 +277,20 @@ class RoadNetworkSelector:
                     edge_colors[i] = 'blue'
                     edge_widths[i] = 3
         edges.plot(ax=self.ax, color=edge_colors, linewidth=edge_widths, alpha=0.7)
-        selected_or_gathering_nodes = []
-        node_colors = []
-        node_sizes = []
-
-        gathering_node_ids = set(self.gathering_points.values())
-        for node_id in self.nodes.index:
-            if node_id in gathering_node_ids:
-                selected_or_gathering_nodes.append(node_id)
-                node_colors.append('green')
-                node_sizes.append(120)
+        node_colors = ['lightgrey'] * len(self.nodes)
+        node_sizes = [30] * len(self.nodes)
+        for i, node_id in enumerate(self.nodes.index):  # 标注普通道路节点和集合点
+            if node_id in self.gathering_points:
+                node_colors[i] = 'green'
+                node_sizes[i] = 120
             elif node_id in self.selected_nodes:
-                selected_or_gathering_nodes.append(node_id)
-                node_colors.append('red')
-                node_sizes.append(100)
-        if selected_or_gathering_nodes:
-            self.nodes.loc[selected_or_gathering_nodes].plot(
-                ax=self.ax,
-                color=node_colors,
-                markersize=node_sizes,
-                alpha=0.8
-            )
+                node_colors[i] = 'red'
+                node_sizes[i] = 100
+
+        self.nodes.plot(ax=self.ax, color=node_colors, markersize=node_sizes, alpha=0.8)
         self.draw_disaster_layers()
         plt.suptitle(self.location_name, fontsize=16, y=0.98)
+        # 模式提示标语
         if self.mode == 'nodes':
             subtitle = 'Selection Mode: Nodes - Click on intersections'
             self.btn_toggle.label.set_text('Road Selection')
@@ -327,20 +314,14 @@ class RoadNetworkSelector:
         plt.title(subtitle, fontsize=12)
         self.ax.set_xlabel('Longitude')
         self.ax.set_ylabel('Latitude')
-        for gp_num, node_id in self.gathering_points.items():
-            if gp_num in self.gathering_point_capacities:
+        for node_id in self.gathering_points:  # 标注集合点容量
+            if node_id in self.gathering_point_capacities:
                 node_geom = self.nodes.loc[node_id].geometry
-                capacity = self.gathering_point_capacities[gp_num]
+                cap = self.gathering_point_capacities[node_id]
+                self.ax.text(node_geom.x + 10, node_geom.y + 10, f"Capacity: {cap}",
+                             fontsize=10, color='darkgreen', ha='left', va='bottom',
+                             bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'))
 
-                self.ax.text(
-                    node_geom.x + 10, node_geom.y + 10,
-                    f"Gathering point{gp_num}\nCapacity: {capacity}",
-                    fontsize=10, color='darkgreen',
-                    ha='left', va='bottom',
-                    bbox=dict(facecolor='white', alpha=0.7,
-                              edgecolor='darkgreen', linewidth=1.5,
-                              boxstyle='round,pad=0.3')
-                )
         if not hasattr(self, '_init_view') or self._init_view is None:
             self._init_view = (self.ax.get_xlim(), self.ax.get_ylim())
         if preserve_view and xlim and ylim:
@@ -350,7 +331,7 @@ class RoadNetworkSelector:
             self.ax.set_xlim(self._init_view[0])
             self.ax.set_ylim(self._init_view[1])
 
-        self.fig.canvas.draw_idle()
+        self.fig.canvas.draw_idle()  # 更新画布
 
     def draw_disaster_layers(self):
         """在地图上绘制灾害图层"""
@@ -400,80 +381,18 @@ class RoadNetworkSelector:
 
     def connect_events(self):
         self.cid_click = self.fig.canvas.mpl_connect('button_press_event', self.on_click)
-        self.cid_release = self.fig.canvas.mpl_connect('button_release_event', self.on_release)
-        self.cid_motion = self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
 
     def on_click(self, event):
         if event.inaxes != self.ax:
             return
-
-        if event.button == 3:  # 右键
-            self.is_dragging = True
-            self.drag_start_x = event.xdata
-            self.drag_start_y = event.ydata
-            self.drag_xlim_start = self.ax.get_xlim()
-            self.drag_ylim_start = self.ax.get_ylim()
-            return
-
-        if event.button == 1:  # 左键
-            if self.mode == 'nodes':
-                self.select_node(event)
-            elif self.mode == 'edges':
-                self.select_edge(event)
-            elif self.mode == 'arterial':
-                self.select_arterial(event)
-            else:
-                self.select_gathering_point(event)
-
-    def on_release(self, event):
-        """鼠标释放时停止拖动"""
-        if event.button == 3:  # 右键释放
-            self.is_dragging = False
-            self.drag_start_x = None
-            self.drag_start_y = None
-            self.drag_xlim_start = None
-            self.drag_ylim_start = None
-
-    def on_motion(self, event):
-        """鼠标移动时拖动地图（限制在初始边界范围内）"""
-        if not self.is_dragging or event.xdata is None or event.ydata is None:
-            return
-
-        if event.inaxes != self.ax:
-            return
-
-        # 计算拖动偏移量
-        dx = self.drag_start_x - event.xdata
-        dy = self.drag_start_y - event.ydata
-
-        # 计算新的视图范围
-        new_xlim = (self.drag_xlim_start[0] + dx, self.drag_xlim_start[1] + dx)
-        new_ylim = (self.drag_ylim_start[0] + dy, self.drag_ylim_start[1] + dy)
-
-        # 获取初始边界范围
-        if hasattr(self, '_init_view') and self._init_view is not None:
-            init_xlim, init_ylim = self._init_view
-
-            # 限制拖动范围不超过初始边界
-            # X轴限制
-            if new_xlim[0] < init_xlim[0]:
-                offset = init_xlim[0] - new_xlim[0]
-                new_xlim = (new_xlim[0] + offset, new_xlim[1] + offset)
-            if new_xlim[1] > init_xlim[1]:
-                offset = new_xlim[1] - init_xlim[1]
-                new_xlim = (new_xlim[0] - offset, new_xlim[1] - offset)
-
-            # Y轴限制
-            if new_ylim[0] < init_ylim[0]:
-                offset = init_ylim[0] - new_ylim[0]
-                new_ylim = (new_ylim[0] + offset, new_ylim[1] + offset)
-            if new_ylim[1] > init_ylim[1]:
-                offset = new_ylim[1] - init_ylim[1]
-                new_ylim = (new_ylim[0] - offset, new_ylim[1] - offset)
-
-        self.ax.set_xlim(new_xlim)
-        self.ax.set_ylim(new_ylim)
-        self.fig.canvas.draw_idle()
+        if self.mode == 'nodes':
+            self.select_node(event)
+        elif self.mode == 'edges':
+            self.select_edge(event)
+        elif self.mode == 'arterial':
+            self.select_arterial(event)
+        else:
+            self.select_gathering_point(event)
 
     def toggle_mode(self, event):  # 在节点模式和道路选择模式中切换
         if self.mode == 'nodes':
@@ -485,7 +404,6 @@ class RoadNetworkSelector:
         self.temp_edge = []
         self.draw_map()
 
-
     def toggle_arterial(self, event):  # 在干路模式和普通道路模式中切换
         if self.mode == 'arterial':
             self.mode = 'edges'
@@ -496,7 +414,7 @@ class RoadNetworkSelector:
         self.temp_edge = []
         self.draw_map()
 
-    def toggle_gathering(self, event):  # 在Gathering point选择模式和道路选择模式中切换
+    def toggle_gathering(self, event):  # 在集合点选择模式和道路选择模式中切换
         if self.mode == 'gathering':
             self.mode = 'edges'
             self.btn_gathering.label.set_text('Switch to Gathering Points')
@@ -526,6 +444,7 @@ class RoadNetworkSelector:
         status = "显示" if self.disaster_visible['Flood'] else "隐藏"
         print(f"洪水灾害图层: {status}")
         self.draw_map()
+
     def zoom_in(self, event):
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
@@ -550,13 +469,11 @@ class RoadNetworkSelector:
         self.ax.set_ylim([ymid - ydelta, ymid + ydelta])
         self.fig.canvas.draw_idle()
 
-
     def zoom_reset(self, event):
         if hasattr(self, '_init_view') and self._init_view is not None:
             self.ax.set_xlim(self._init_view[0])
             self.ax.set_ylim(self._init_view[1])
             self.fig.canvas.draw_idle()
-
 
     def select_node(self, event):  # 点击节点 → 红色高亮，再点一次取消
         self.save_history()
@@ -579,8 +496,7 @@ class RoadNetworkSelector:
                 print(f"Node Selected: {nearest_node}")
             self.draw_map()
 
-
-    def select_gathering_point(self, event):  # 点击选择Gathering point，并弹出输入界面
+    def select_gathering_point(self, event):  # 点击选择集合点，并弹出输入界面
         self.save_history()
         x, y = event.xdata, event.ydata
         click_point = Point(x, y)
@@ -593,45 +509,26 @@ class RoadNetworkSelector:
                 min_dist = dist
                 nearest_node = node_id
         if nearest_node is not None and min_dist < 100:
-            # 检查是否已经是Gathering point
-            existing_gp_num = None
-            for gp_num, node_id in self.gathering_points.items():
-                if node_id == nearest_node:
-                    existing_gp_num = gp_num
-                    break
-
-            if existing_gp_num is not None:
-                # 取消Gathering point
-                del self.gathering_points[existing_gp_num]
-                if existing_gp_num in self.gathering_point_capacities:
-                    del self.gathering_point_capacities[existing_gp_num]
-                print(f"取消选择Gathering point{existing_gp_num}")
+            if nearest_node in self.gathering_points:
+                self.gathering_points.remove(nearest_node)
+                if nearest_node in self.gathering_point_capacities:
+                    del self.gathering_point_capacities[nearest_node]
+                print(f"Cancel selecting gathering point:{nearest_node}")
             else:
-                # 新增Gathering point
-                gp_number = self.next_gp_number
-                self.gathering_points[gp_number] = nearest_node
-                self.next_gp_number += 1
-
+                self.gathering_points.add(nearest_node)
                 if nearest_node not in self.selected_nodes:
                     self.selected_nodes.add(nearest_node)
-
                 try:
-                    capacity_str = input(f"请输入Gathering point{gp_number}的Capacity：")
+                    capacity_str = input(f"Please enter the capacity of gathering point{nearest_node} ：")
                     capacity = int(capacity_str)
                     if capacity > 0:
-                        self.gathering_point_capacities[gp_number] = capacity
-                        print(f"✅ Gathering point{gp_number}已选择，Capacity: {capacity}人")
+                        self.gathering_point_capacities[nearest_node] = capacity
+                        print(f"Gathering point selected: {nearest_node},Capacity: {capacity}")
                     else:
-                        print("❌ 错误：Capacity必须为正整数")
-                        del self.gathering_points[gp_number]
-                        self.next_gp_number -= 1
+                        print("Error! Capacity has to be positive int")
                 except Exception as e:
-                    print(f"❌ 输入错误: {e}")
-                    del self.gathering_points[gp_number]
-                    self.next_gp_number -= 1
-
+                    print(f"Error! Gathering point{e} incorrect")
             self.draw_map()
-
 
     def select_edge(self, event):
         self.save_history()
@@ -686,22 +583,13 @@ class RoadNetworkSelector:
                     self.selected_path_nodes.update(path_set)
                     for i in range(len(path) - 1):
                         u, v = path[i], path[i + 1]
-                        # 先尝试正向边 u->v
                         if self.original_G.has_edge(u, v):
                             for k in self.original_G.get_edge_data(u, v).keys():
                                 self.selected_edges.add((u, v, k))
                                 print(f"添加边: ({u}, {v}, {k})")
-                        # 如果没有正向边，尝试反向边 v->u
-                        elif self.original_G.has_edge(v, u):
-                            for k in self.original_G.get_edge_data(v, u).keys():
-                                self.selected_edges.add((v, u, k))
-                                print(f"添加边（反向）: ({v}, {u}, {k})")
-                        else:
-                            print(f"警告：边 ({u}, {v}) 双向都不存在")
-                    print(f"Edge from {start_node} to {end_node} has been selected")
+                    print(f"Edge from{start_node} to {end_node} has been selected")
                 self.temp_edge = []
             self.draw_map()
-
 
     def select_arterial(self, event):
         self.save_history()
@@ -735,39 +623,26 @@ class RoadNetworkSelector:
                     self.selected_path_nodes.update(path_set)
                     for i in range(len(path) - 1):
                         u, v = path[i], path[i + 1]
-                        # 先尝试正向边 u->v
                         if self.original_G.has_edge(u, v):
                             for k in self.original_G.get_edge_data(u, v).keys():
                                 self.selected_edges.add((u, v, k))
                                 self.arterial_edges.add((u, v, k))
-                        # 如果没有正向边，尝试反向边 v->u
-                        elif self.original_G.has_edge(v, u):
-                            for k in self.original_G.get_edge_data(v, u).keys():
-                                self.selected_edges.add((v, u, k))
-                                self.arterial_edges.add((v, u, k))
-                        else:
-                            print(f"警告：边 ({u}, {v}) 双向都不存在")
-                    self.temp_edge = []
+                self.temp_edge = []
             self.draw_map()
 
     def find_shortest_path(self, start_node, end_node):
-        """
-        使用无向图寻找最短路径，但返回的路径节点序列
-        """
         try:
-            # 创建临时无向图用于路径搜索
-            G_undirected = self.original_G.to_undirected()
-            path = nx.shortest_path(G_undirected, start_node, end_node, weight='length')
+            path = nx.shortest_path(self.original_G, start_node, end_node, weight='length')
             return path
         except nx.NetworkXNoPath:
-            print(f"There is NO path from node {start_node} to {end_node}")
+            print(f"There is NO edge from node {start_node} to {end_node}")
             return None
 
     def calculate_all_distances(self, event):
-        """计算每个需求点到所有Gathering point的最短距离"""
+        """计算每个需求点到所有集合点的最短距离"""
 
         if not self.gathering_points:
-            print("错误：没有选择Gathering point，请先选择Gathering point")
+            print("错误：没有选择集合点，请先选择集合点")
             return
 
         if not self.region_centroid_nodes:
@@ -775,57 +650,61 @@ class RoadNetworkSelector:
             return
 
         print("\n" + "=" * 60)
-        print("正在计算每个需求点到所有Gathering point的最短距离")
+        print("正在计算每个需求点到所有集合点的最短距离")
         print("=" * 60)
         print(f"需求点数量: {len(self.region_centroid_nodes)}")
-        print(f"Gathering point数量: {len(self.gathering_points)}")
+        print(f"集合点数量: {len(self.gathering_points)}")
+        print(f"使用路网: 完整OSM路网 ({len(self.original_G.nodes)} 个节点)")
 
+        # 初始化距离矩阵
         centroid_ids = [node_id for node_id, _ in self.region_centroid_nodes]
-        gathering_point_numbers = sorted(self.gathering_points.keys())  # 用于显示
-        gathering_node_ids = [self.gathering_points[num] for num in gathering_point_numbers]  # 用于索引
+        gathering_point_ids = list(self.gathering_points)
 
         self.distance_matrix = pd.DataFrame(
             index=centroid_ids,
-            columns=gathering_node_ids,  # ← 改为节点ID
+            columns=gathering_point_ids,
             dtype=float
         )
-        self.distance_matrix[:] = float('inf')
+        self.distance_matrix[:] = float('inf')  # 初始化为无穷大
         self.shortest_paths = {}
 
-        # 对每个需求点计算到所有Gathering point的距离
+        # 对每个需求点计算到所有集合点的距离
         for i, (centroid_id, centroid_geom) in enumerate(self.region_centroid_nodes):
-            print(f"\n【需求点{i + 1}】")  # ✅ 只显示编号
-            print(f"坐标: ({centroid_geom.x:.1f}, {centroid_geom.y:.1f})")
-
+            print(f"\n【DP {i + 1}】- Node ID: {centroid_id}")
+            print(f"coordinate: ({centroid_geom.x:.1f}, {centroid_geom.y:.1f})")
             try:
+                # 使用Dijkstra算法计算从该需求点到所有可达节点的最短距离
                 distances, paths = nx.single_source_dijkstra(
                     self.original_G,
                     centroid_id,
                     weight='length'
                 )
+                print(f"从该需求点可达 {len(distances)} 个节点")
 
-                for gp_num in gathering_point_numbers:
-                    gathering_node_id = self.gathering_points[gp_num]
+                # 检查每个集合点的可达性和距离
+                for j, gathering_point in enumerate(gathering_point_ids):
+                    if gathering_point in distances:
+                        distance = distances[gathering_point]
+                        path = paths[gathering_point]
 
-                    if gathering_node_id in distances:
-                        distance = distances[gathering_node_id]
-                        path = paths[gathering_node_id]
+                        # 存储距离和路径
+                        self.distance_matrix.loc[centroid_id, gathering_point] = distance
+                        self.shortest_paths[(centroid_id, gathering_point)] = path
 
-                        self.distance_matrix.loc[centroid_id, gathering_node_id] = distance  # ← 改为节点ID
-                        self.shortest_paths[(centroid_id, gathering_node_id)] = path  # ← 改为节点ID
+                        # 获取集合点信息
+                        capacity = self.gathering_point_capacities.get(gathering_point, "未设置")
 
-                        capacity = self.gathering_point_capacities.get(gp_num, "未设置")
-
-                        print(f"  ├─ Gathering point{gp_num}: {distance:.1f}米 "  # ✅ 只显示编号
-                              f"(Capacity: {capacity}, 路径经过 {len(path)} 个节点)")
+                        print(f"  ├─ 集合点 {gathering_point}: {distance:.1f}米 "
+                              f"(容量: {capacity}, 路径经过 {len(path)} 个节点)")
                     else:
-                        print(f"  ├─ Gathering point{gp_num}: 不可达")  # ✅ 只显示编号
-
+                        print(f"  ├─ 集合点 {gathering_point}: 不可达")
             except Exception as e:
                 print(f"  ❌ 计算失败: {e}")
 
+        # 显示完整的距离矩阵和分析
         self.display_complete_distance_analysis()
 
+        # 自动生成可视化
         print("\n正在生成距离矩阵可视化...")
         self.visualize_distance_matrix()
 
@@ -836,9 +715,11 @@ class RoadNetworkSelector:
         print("距离矩阵分析结果")
         print("=" * 60)
 
+        # 1. 显示完整距离矩阵
         print("\n【完整距离矩阵】(单位: 米)")
         print("-" * 50)
 
+        # 格式化矩阵显示
         formatted_matrix = self.distance_matrix.copy()
         for col in formatted_matrix.columns:
             for idx in formatted_matrix.index:
@@ -848,30 +729,30 @@ class RoadNetworkSelector:
                 else:
                     formatted_matrix.loc[idx, col] = f"{val:.1f}"
 
+        # 设置列名为集合点ID + 容量
         column_names = []
-        for gp_num in sorted(self.gathering_points.keys()):
-            gathering_node_id = self.gathering_points[gp_num]
-            distances_to_gp = self.distance_matrix[gathering_node_id]
+        for gp in formatted_matrix.columns:
+            capacity = self.gathering_point_capacities.get(gp, "?")
+            column_names.append(f"GP{gp}\n(Capacity:{capacity})")
         formatted_matrix.columns = column_names
 
-        # 行名
+        # 设置行名为需求点编号
         row_names = []
         for i, centroid_id in enumerate(formatted_matrix.index):
-            row_names.append(f"需求点{i + 1}")
+            row_names.append(f"DP{i + 1}\n(Node{centroid_id})")
         formatted_matrix.index = row_names
-
         print(formatted_matrix.to_string())
 
-        # 统计分析
+        # 2. 统计分析
         print(f"\n【统计分析】")
         print("-" * 30)
 
+        # 每个需求点的统计
         for i, (centroid_id, _) in enumerate(self.region_centroid_nodes):
             distances = self.distance_matrix.loc[centroid_id]
             reachable_distances = distances[distances != float('inf')]
-
-            print(f"\n需求点{i + 1}:")  # ✅ 移除节点ID
-            print(f"  ├─ 可达Gathering point数量: {len(reachable_distances)}/{len(self.gathering_points)}")
+            print(f"\nDP {i + 1} (Node {centroid_id}):")
+            print(f"  ├─ 可达集合点数量: {len(reachable_distances)}/{len(self.gathering_points)}")
 
             if len(reachable_distances) > 0:
                 min_dist = reachable_distances.min()
@@ -879,23 +760,22 @@ class RoadNetworkSelector:
                 avg_dist = reachable_distances.mean()
                 closest_gp = reachable_distances.idxmin()
                 farthest_gp = reachable_distances.idxmax()
-
-                print(f"  ├─ 最近距离: {min_dist:.1f}米 (Gathering point{closest_gp})")  # ✅ 只显示编号
-                print(f"  ├─ 最远距离: {max_dist:.1f}米 (Gathering point{farthest_gp})")
+                print(f"  ├─ 最近距离: {min_dist:.1f}米 (集合点 {closest_gp})")
+                print(f"  ├─ 最远距离: {max_dist:.1f}米 (集合点 {farthest_gp})")
                 print(f"  └─ 平均距离: {avg_dist:.1f}米")
             else:
-                print(f"  └─ ❌ 无可达Gathering point")
+                print(f"  └─ ❌ 无可达集合点")
 
-        # Gathering point统计
-        print(f"\n【Gathering point分析】")
+        # 3. 集合点统计
+        print(f"\n【集合点分析】")
         print("-" * 30)
 
-        for gp_num in sorted(self.gathering_points.keys()):
-            distances_to_gp = self.distance_matrix[gp_num]
+        for gp in self.gathering_points:
+            distances_to_gp = self.distance_matrix[gp]
             reachable_from = distances_to_gp[distances_to_gp != float('inf')]
-            capacity = self.gathering_point_capacities.get(gp_num, "未设置")
+            capacity = self.gathering_point_capacities.get(gp, "未设置")
 
-            print(f"\nGathering point{gp_num} (Capacity: {capacity}):")  # ✅ 只显示编号
+            print(f"\nGP {gp} (Capacity: {capacity}):")
             print(f"  ├─ 可被到达的需求点数量: {len(reachable_from)}/{len(self.region_centroid_nodes)}")
 
             if len(reachable_from) > 0:
@@ -1638,9 +1518,9 @@ class RoadNetworkSelector:
         print("\n✅ 穿越次数矩阵计算完成！")
 
     def calculate_crossing_matrix(self):
-        """计算需求点到Gathering point的穿越次数矩阵"""
+        """计算需求点到集合点的穿越次数矩阵"""
         if not self.region_centroid_nodes or not self.gathering_points:
-            print("没有需求点或Gathering point，无法计算穿越次数矩阵")
+            print("没有需求点或集合点，无法计算穿越次数矩阵")
             return None
 
         # 获取干路线段
@@ -1674,11 +1554,11 @@ class RoadNetworkSelector:
                     continue
 
             for j, gathering_node in enumerate(self.gathering_points):
-                # 获取Gathering point坐标
+                # 获取集合点坐标
                 try:
                     gathering_point = Point(self.G.nodes[gathering_node]['x'], self.G.nodes[gathering_node]['y'])
                 except:
-                    print(f"无法获取Gathering point {j + 1} 的坐标")
+                    print(f"无法获取集合点 {j + 1} 的坐标")
                     continue
 
                 # 创建直线连接
@@ -1688,7 +1568,7 @@ class RoadNetworkSelector:
                 crossings = self.count_crossings_for_line(connection_line, arterial_lines)
                 crossing_matrix[i, j] = crossings
 
-                print(f"需求点 {i + 1} 到Gathering point {j + 1}: {crossings} 次穿越")
+                print(f"需求点 {i + 1} 到集合点 {j + 1}: {crossings} 次穿越")
 
         self.crossing_matrix = crossing_matrix
         print("穿越次数矩阵计算完成")
@@ -1750,7 +1630,7 @@ class RoadNetworkSelector:
             return
 
         if not self.gathering_points:
-            print("错误：没有选择Gathering point，请先选择Gathering point")
+            print("错误：没有选择集合点，请先选择集合点")
             return
 
         if not hasattr(self, 'distance_matrix') or self.distance_matrix is None:
@@ -1813,11 +1693,12 @@ class RoadNetworkSelector:
                 distance = self.distance_matrix.loc[demand_node, gathering_node]
 
                 print(f"需求点 {i + 1} (Node {demand_node}, 需求 {demand}) -> "
-                      f"Gathering point {j + 1} (Node {gathering_node}) : {distance:.1f}m")
+                      f"集合点 {j + 1} (Node {gathering_node}) : {distance:.1f}m")
+
 
 if __name__ == "__main__":
     selector = RoadNetworkSelector(
         location=(34.6937, 135.1955),
-        dist=2000,
+        dist=1000,
         location_name="Sannomiya"
     )
