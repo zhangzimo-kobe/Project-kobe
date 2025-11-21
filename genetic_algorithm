@@ -66,18 +66,17 @@ class MultiObjectiveGA:
         self.num_demands = len(self.demand_nodes)
 
         # 提取集合点信息
-        self.gathering_numbers = sorted(self.road_network.gathering_points.keys())
-        self.gathering_nodes = [self.road_network.gathering_points[num]
-                                for num in self.gathering_numbers]
-        self.num_gathering = len(self.gathering_numbers)
+        self.gathering_nodes = sorted(list(self.road_network.gathering_points))  # 将set转换为排序后的列表
+        self.gathering_numbers = self.gathering_nodes  # 节点ID就是编号
+        self.num_gathering = len(self.gathering_nodes)
 
         # 提取需求量
         self.demands = np.array([self.road_network.demand_quantities.get(node, 0)
                                  for node in self.demand_nodes])
 
         # 提取容量
-        self.capacities = np.array([self.road_network.gathering_point_capacities.get(num, 0)
-                                    for num in self.gathering_numbers])
+        self.capacities = np.array([self.road_network.gathering_point_capacities.get(node, 0)
+                                for node in self.gathering_nodes])
 
         # 提取距离矩阵（使用基于地形的距离限制）
         distance_df = self.road_network.distance_matrix
