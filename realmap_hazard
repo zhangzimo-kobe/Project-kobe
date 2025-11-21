@@ -780,13 +780,13 @@ class RoadNetworkSelector:
         print(f"需求点数量: {len(self.region_centroid_nodes)}")
         print(f"Gathering point数量: {len(self.gathering_points)}")
 
-        # 初始化距离矩阵
         centroid_ids = [node_id for node_id, _ in self.region_centroid_nodes]
-        gathering_point_numbers = sorted(self.gathering_points.keys())  # [1, 2, 3, ...]
+        gathering_point_numbers = sorted(self.gathering_points.keys())  # 用于显示
+        gathering_node_ids = [self.gathering_points[num] for num in gathering_point_numbers]  # 用于索引
 
         self.distance_matrix = pd.DataFrame(
             index=centroid_ids,
-            columns=gathering_point_numbers,
+            columns=gathering_node_ids,  # ← 改为节点ID
             dtype=float
         )
         self.distance_matrix[:] = float('inf')
@@ -811,8 +811,8 @@ class RoadNetworkSelector:
                         distance = distances[gathering_node_id]
                         path = paths[gathering_node_id]
 
-                        self.distance_matrix.loc[centroid_id, gp_num] = distance
-                        self.shortest_paths[(centroid_id, gp_num)] = path
+                        self.distance_matrix.loc[centroid_id, gathering_node_id] = distance  # ← 改为节点ID
+                        self.shortest_paths[(centroid_id, gathering_node_id)] = path  # ← 改为节点ID
 
                         capacity = self.gathering_point_capacities.get(gp_num, "未设置")
 
@@ -848,17 +848,16 @@ class RoadNetworkSelector:
                 else:
                     formatted_matrix.loc[idx, col] = f"{val:.1f}"
 
-        # ✅ 修改：列名只显示编号和Capacity
         column_names = []
-        for gp_num in formatted_matrix.columns:
-            capacity = self.gathering_point_capacities.get(gp_num, "?")
-            column_names.append(f"Gathering point{gp_num}\n(Capacity{capacity})")  # ✅ 移除节点ID
+        for gp_num in sorted(self.gathering_points.keys()):
+            gathering_node_id = self.gathering_points[gp_num]
+            distances_to_gp = self.distance_matrix[gathering_node_id]
         formatted_matrix.columns = column_names
 
         # 行名
         row_names = []
         for i, centroid_id in enumerate(formatted_matrix.index):
-            row_names.append(f"需求点{i + 1}")  # ✅ 也可以移除需求点的节点ID
+            row_names.append(f"需求点{i + 1}")
         formatted_matrix.index = row_names
 
         print(formatted_matrix.to_string())
