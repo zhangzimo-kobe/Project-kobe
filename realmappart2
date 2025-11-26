@@ -1,4 +1,172 @@
-     def display_complete_distance_analysis(self):
+     def select_arterial(self, event):
+        self.save_history()
+        x, y = event.xdata, event.ydata
+        click_point = Point(x, y)
+        min_dist = float('inf')
+        nearest_node = None
+        for node_id, node_data in self.nodes.iterrows():
+            node_geom = node_data.geometry
+            dist = node_geom.distance(click_point)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_node = node_id
+        if nearest_node is not None and min_dist < 100:
+            self.temp_edge.append(nearest_node)
+            if len(self.temp_edge) == 2:
+                start_node, end_node = self.temp_edge
+                path = self.find_shortest_path(start_node, end_node)
+                if path:
+                    if not hasattr(self, 'selected_path_nodes'):
+                        self.selected_path_nodes = set()
+                    for u, v, k in self.arterial_edges:
+                        self.selected_path_nodes.add(u)
+                        self.selected_path_nodes.add(v)
+                    path_set = set(path)
+                    self.selected_nodes.add(start_node)
+                    self.selected_nodes.add(end_node)
+                    common_nodes = path_set & self.selected_path_nodes
+                    for node in common_nodes:
+                        self.selected_nodes.add(node)
+                    self.selected_path_nodes.update(path_set)
+                    for i in range(len(path) - 1):
+                        u, v = path[i], path[i + 1]
+                        if self.original_G.has_edge(u, v):
+                            for k in self.original_G.get_edge_data(u, v).keys():
+                                self.selected_edges.add((u, v, k))
+                                self.arterial_edges.add((u, v, k))
+                self.temp_edge = []
+            self.draw_map()
+
+    def find_shortest_path(self, start_node, end_node):
+        try:
+            path = nx.shortest_path(self.original_G, start_node, end_node, weight='length')
+            return path
+        except nx.NetworkXNoPath:
+            print(f"There is NO edge from node {start_node} to {end_node}")
+            return None
+
+    def calculate_all_distances(self, event):
+        """分别计算每个需求点到一级集合点和二级集合点的最短距离"""
+
+        if not self.primary_gathering_points and not self.secondary_gathering_points:
+            print("错误：没有选择集合点，请先选择一级或二级集合点")
+            return
+
+        if not self.region_centroid_nodes:
+            print("错误：没有发现小区，请先完成选择以识别小区")
+            return
+
+        print("\n" + "=" * 60)
+        print("开始计算距离矩阵")
+        print("=" * 60)
+        print(f"需求点数量: {len(self.region_centroid_nodes)}")
+        print(f"一级集合点数量: {len(self.primary_gathering_points)}")
+        print(f"二级集合点数量: {len(self.secondary_gathering_points)}")
+        print(f"使用路网: 完整OSM路网 ({len(self.original_G.nodes)} 个节点)")
+
+        # 初始化存储结构
+        centroid_ids = [node_id for node_id, _ in self.region_centroid_nodes]
+
+        # 一级集合点距离矩阵
+        self.primary_distance_matrix = None
+        self.primary_shortest_paths = {}
+
+        # 二级集合点距离矩阵
+        self.secondary_distance_matrix = None
+        self.secondary_shortest_paths = {}
+
+        # === 计算到一级集合点的距离 ===
+        if self.primary_gathering_points:
+            print("\n" + "=" * 60)
+            print("【计算到一级集合点的距离】")
+            print("=" * 60)
+
+            primary_gp_ids = list(self.primary_gathering_points)
+            self.primary_distance_matrix = pd.DataFrame(
+                index=centroid_ids,
+                columns=primary_gp_ids,
+                dtype=float
+            )
+            self.primary_distance_matrix[:] = float('inf')
+
+            for i, (centroid_id, centroid_geom) in enumerate(self.region_centroid_nodes):
+                print(f"\n【需求点 {i + 1}】- Node ID: {centroid_id}")
+                print(f"坐标: ({centroid_geom.x:.1f}, {centroid_geom.y:.1f})")
+
+                try:
+                    distances, paths = nx.single_source_dijkstra(
+                        self.original_G,
+                        centroid_id,
+                        weight='length'
+                    )
+                    print(f"从该需求点可达 {len(distances)} 个节点")
+
+                    for j, gathering_point in enumerate(primary_gp_ids):
+                        if gathering_point in distances:
+                            distance = distances[gathering_point]
+                            path = paths[gathering_point]
+
+                            self.primary_distance_matrix.loc[centroid_id, gathering_point] = distance
+                            self.primary_shortest_paths[(centroid_id, gathering_point)] = path
+
+                            capacity = self.primary_capacities.get(gathering_point, "未设置")
+                            print(f"  ├─ 一级集合点 {gathering_point}: {distance:.1f}米 "
+                                  f"(容量: {capacity}, 路径经过 {len(path)} 个节点)")
+                        else:
+                            print(f"  ├─ 一级集合点 {gathering_point}: 不可达")
+                except Exception as e:
+                    print(f"  ❌ 计算失败: {e}")
+
+        # === 计算到二级集合点的距离 ===
+        if self.secondary_gathering_points:
+            print("\n" + "=" * 60)
+            print("【计算到二级集合点的距离】")
+            print("=" * 60)
+
+            secondary_gp_ids = list(self.secondary_gathering_points)
+            self.secondary_distance_matrix = pd.DataFrame(
+                index=centroid_ids,
+                columns=secondary_gp_ids,
+                dtype=float
+            )
+            self.secondary_distance_matrix[:] = float('inf')
+
+            for i, (centroid_id, centroid_geom) in enumerate(self.region_centroid_nodes):
+                print(f"\n【需求点 {i + 1}】- Node ID: {centroid_id}")
+                print(f"坐标: ({centroid_geom.x:.1f}, {centroid_geom.y:.1f})")
+
+                try:
+                    distances, paths = nx.single_source_dijkstra(
+                        self.original_G,
+                        centroid_id,
+                        weight='length'
+                    )
+                    print(f"从该需求点可达 {len(distances)} 个节点")
+
+                    for j, gathering_point in enumerate(secondary_gp_ids):
+                        if gathering_point in distances:
+                            distance = distances[gathering_point]
+                            path = paths[gathering_point]
+
+                            self.secondary_distance_matrix.loc[centroid_id, gathering_point] = distance
+                            self.secondary_shortest_paths[(centroid_id, gathering_point)] = path
+
+                            capacity = self.secondary_capacities.get(gathering_point, "未设置")
+                            print(f"  ├─ 二级集合点 {gathering_point}: {distance:.1f}米 "
+                                  f"(容量: {capacity}, 路径经过 {len(path)} 个节点)")
+                        else:
+                            print(f"  ├─ 二级集合点 {gathering_point}: 不可达")
+                except Exception as e:
+                    print(f"  ❌ 计算失败: {e}")
+
+        # 显示完整的距离矩阵和分析
+        self.display_complete_distance_analysis()
+
+        # 自动生成可视化
+        print("\n正在生成距离矩阵可视化...")
+        self.visualize_distance_matrix()
+
+    def display_complete_distance_analysis(self):
         """显示完整的距离矩阵分析（分别显示一级和二级）"""
 
         print("\n" + "=" * 60)
@@ -350,11 +518,6 @@
                 self.selected_G.add_edge(u, v, key=k, **edge_data)
 
         self.display_selected_network()
-        if self.region_centroid_nodes and (self.primary_gathering_points or self.secondary_gathering_points):
-            print("\n" + "=" * 50)
-            print("正在计算需求点到集结点的最少穿越次数...")
-            print("=" * 50)
-            self.calculate_crossing_distances()
 
     def input_demand_quantities(self, event):
         """手动输入各需求点的低能人群和健全人群疏散需求量"""
@@ -427,350 +590,3 @@
         print(f"  ├─ 总低能人群: {total_vulnerable}")
         print(f"  ├─ 总健全人群: {total_able}")
         print(f"  └─ 总计: {total_vulnerable + total_able}")
-
-    def display_selected_network(self):
-        def count_crossings(line, arterial_lines):
-            crossings = 0
-            for arterial in arterial_lines:
-                if arterial.geom_type == 'MultiLineString':
-                    sublines = list(arterial.geoms)
-                else:
-                    sublines = [arterial]
-                for subline in sublines:
-                    inter = line.intersection(subline)
-                    if inter.is_empty:
-                        continue
-                    if inter.geom_type == 'Point':
-                        if not Point(line.coords[0]).equals(inter) and not Point(line.coords[-1]).equals(inter):
-                            crossings += 1
-                    elif inter.geom_type == 'MultiPoint':
-                        for pt in inter.geoms:
-                            if not Point(line.coords[0]).equals(pt) and not Point(line.coords[-1]).equals(pt):
-                                crossings += 1
-            return crossings
-
-        def find_closest_node(point, nodes_gdf, polygon):
-            """Find the closest node to a given point that is inside the polygon"""
-            # 首先筛选出多边形内部的节点
-            nodes_in_polygon = nodes_gdf[nodes_gdf.geometry.apply(lambda g: polygon.contains(g))]
-
-            # 如果多边形内没有节点，则回退到使用边界上的节点
-            if len(nodes_in_polygon) == 0:
-                # 尝试找边界上的节点（与多边形相交的节点）
-                nodes_on_boundary = nodes_gdf[nodes_gdf.geometry.apply(lambda g: polygon.boundary.distance(g) < 1e-8)]
-                if len(nodes_on_boundary) == 0:
-                    # 如果边界上也没有，则使用所有节点
-                    print(f"警告: 一个区域内部或边界上没有找到节点，使用最近的节点。")
-                    distances = nodes_gdf.geometry.distance(point)
-                    closest_node_idx = distances.idxmin()
-                    return closest_node_idx, nodes_gdf.loc[closest_node_idx].geometry
-                else:
-                    # 使用边界上距离最近的节点
-                    print(f"警告: 一个区域内部没有节点，使用边界上最近的节点。")
-                    distances = nodes_on_boundary.geometry.distance(point)
-                    closest_node_idx = distances.idxmin()
-                    return closest_node_idx, nodes_on_boundary.loc[closest_node_idx].geometry
-
-            # 计算内部节点到几何形心的距离
-            distances = nodes_in_polygon.geometry.distance(point)
-            closest_node_idx = distances.idxmin()
-            return closest_node_idx, nodes_in_polygon.loc[closest_node_idx].geometry
-
-        try:
-            fig, ax = plt.subplots(figsize=(10, 8))
-            # 获取选择的图形的节点和边
-            nodes, edges = ox.graph_to_gdfs(self.selected_G)
-
-            # 获取原始完整图形的所有节点，用于找到小区内的节点
-            original_nodes, _ = ox.graph_to_gdfs(self.original_G)
-            arterial_lines = []
-            arterial_edges_dict = {}
-            for (u, v, k) in self.arterial_edges:
-                if (u, v, k) in edges.index:
-                    edge_geom = edges.loc[(u, v, k)].geometry
-                    if edge_geom.geom_type == 'MultiLineString':
-                        for line in edge_geom.geoms:
-                            arterial_lines.append(line)
-                            arterial_edges_dict[line] = (u, v, k)
-                    elif edge_geom.geom_type == 'LineString':
-                        arterial_lines.append(edge_geom)
-                        arterial_edges_dict[edge_geom] = (u, v, k)
-            region_centroids = []
-            # 修改：存储到类属性中以便Dijkstra算法使用
-            self.region_centroid_nodes = []  # 重置
-            fill_polys = []
-            if arterial_lines:
-                merged = linemerge(arterial_lines)
-                merged = snap(merged, merged, tolerance=1e-6)
-                if hasattr(merged, '__iter__'):
-                    lines_for_poly = list(merged)
-                else:
-                    lines_for_poly = [merged]
-                polygons = list(polygonize(lines_for_poly))
-                for poly in polygons:
-                    if poly.area > 10:
-                        fill_polys.append(poly)
-                region_colors = itertools.cycle([
-                    '#FFEDA0', '#A1D99B', '#9ECAE1', '#FEC44F', '#FB6A4A', '#BCBDDC', '#FEE0D2', '#BDBDBD'
-                ])
-                for idx, poly in enumerate(fill_polys):
-                    x, y = poly.exterior.xy
-                    ax.fill(x, y, color=next(region_colors), alpha=0.4, label=f'Region {idx + 1}' if idx == 0 else "")
-
-                    # Get geometric centroid
-                    centroid = poly.centroid
-                    region_centroids.append(centroid)
-
-                    # 使用原始图形的所有节点找到小区内距离几何形心最近的节点
-                    closest_node_id, closest_node_geom = find_closest_node(centroid, original_nodes, poly)
-
-                    # 如果找到的节点不在选定的图形中，将其添加到选定图形
-                    if closest_node_id not in self.selected_G.nodes:
-                        if closest_node_id in self.original_G.nodes:
-                            node_data = self.original_G.nodes[closest_node_id]
-                            self.selected_G.add_node(closest_node_id, **node_data)
-                            self.selected_nodes.add(closest_node_id)
-                            print(f"将区域 {idx + 1} 的形心节点 {closest_node_id} 添加到选定节点")
-
-                    # 修改：存储到类属性中以便Dijkstra算法使用
-                    self.region_centroid_nodes.append((closest_node_id, closest_node_geom))
-
-                    # 绘制小区内所有原始节点（小尺寸）
-                    nodes_in_poly = original_nodes[original_nodes.geometry.apply(lambda g: poly.contains(g))]
-                    if len(nodes_in_poly) > 0:
-                        ax.scatter(nodes_in_poly.geometry.x, nodes_in_poly.geometry.y,
-                                   marker='o', s=20, color="lightblue", alpha=0.7,
-                                   label="Interior Nodes" if idx == 0 else "")
-                        print(f"区域 {idx + 1} 内有 {len(nodes_in_poly)} 个节点")
-                    else:
-                        print(f"警告：区域 {idx + 1} 内没有找到节点")
-
-                    # Plot both the geometric centroid (small) and the closest node (larger)
-                    ax.scatter(centroid.x, centroid.y, marker='o', s=50, color="gray", alpha=0.5)
-                    ax.scatter(closest_node_geom.x, closest_node_geom.y, marker='^', s=150, color="orange",
-                               edgecolor="black", label="Demand point" if idx == 0 else "")
-
-                    # Draw a line connecting the geometric centroid to the closest node
-                    ax.plot([centroid.x, closest_node_geom.x], [centroid.y, closest_node_geom.y],
-                            'k:', linewidth=0.8, alpha=0.6)
-
-                    # 连接一级集合点到需求点（深绿色虚线）
-                    for p_node in self.primary_gathering_points:
-                        if p_node in nodes.index:
-                            p_geom = nodes.loc[p_node].geometry
-                            if poly.contains(p_geom):
-                                ax.plot([closest_node_geom.x, p_geom.x], [closest_node_geom.y, p_geom.y],
-                                        'g--', linewidth=1.5, alpha=0.7)  # 绿色虚线
-                                mid_x = (closest_node_geom.x + p_geom.x) / 2
-                                mid_y = (closest_node_geom.y + p_geom.y) / 2
-                                ax.text(mid_x, mid_y, '0', fontsize=10, color='darkgreen', weight='bold')
-
-                    # 连接二级集合点到需求点（浅绿色虚线）
-                    for p_node in self.secondary_gathering_points:
-                        if p_node in nodes.index:
-                            p_geom = nodes.loc[p_node].geometry
-                            if poly.contains(p_geom):
-                                ax.plot([closest_node_geom.x, p_geom.x], [closest_node_geom.y, p_geom.y],
-                                        'c--', linewidth=1.5, alpha=0.7)  # 青色虚线
-                                mid_x = (closest_node_geom.x + p_geom.x) / 2
-                                mid_y = (closest_node_geom.y + p_geom.y) / 2
-                                ax.text(mid_x, mid_y, '0', fontsize=10, color='cyan', weight='bold')
-            if len(fill_polys) > 1 and len(self.arterial_edges) > 0:
-                poly_edge_map = []
-                for poly in fill_polys:
-                    coords = list(poly.exterior.coords)
-                    segments = []
-                    for i in range(len(coords) - 1):
-                        seg = LineString([coords[i], coords[i + 1]])
-                        segments.append(seg)
-                    poly_edge_map.append(segments)
-                arterial_match = {}
-                for (u, v, k) in self.arterial_edges:
-                    if (u, v, k) in edges.index:
-                        edge_geom = edges.loc[(u, v, k)].geometry
-                        if edge_geom.geom_type == 'MultiLineString':
-                            lines = list(edge_geom.geoms)
-                        else:
-                            lines = [edge_geom]
-                        for line in lines:
-                            for idx, segments in enumerate(poly_edge_map):
-                                for seg in segments:
-                                    if seg.intersection(line).length > 1.0:
-                                        arterial_match.setdefault((u, v, k), set()).add(idx)
-                adjacent_pairs = set()
-                for match_idxs in arterial_match.values():
-                    if len(match_idxs) == 2:
-                        i, j = sorted(match_idxs)
-                        adjacent_pairs.add((i, j))
-                region_gathering_points = []
-                for poly in fill_polys:
-                    g_points = []
-
-                    # 添加该区域内的一级集合点
-                    for p_node in self.primary_gathering_points:
-                        if p_node in nodes.index:
-                            p_geom = nodes.loc[p_node].geometry
-                            if poly.contains(p_geom):
-                                g_points.append((p_node, p_geom, 'primary'))
-
-                    # 添加该区域内的二级集合点
-                    for p_node in self.secondary_gathering_points:
-                        if p_node in nodes.index:
-                            p_geom = nodes.loc[p_node].geometry
-                            if poly.contains(p_geom):
-                                g_points.append((p_node, p_geom, 'secondary'))
-
-                    region_gathering_points.append(g_points)
-                for i, j in adjacent_pairs:
-                    node_i, geom_i = self.region_centroid_nodes[i]
-                    node_j, geom_j = self.region_centroid_nodes[j]
-
-                    # 区域i的点：需求点 + 一级集合点 + 二级集合点
-                    points_i = [geom_i]  # 先添加需求点
-                    for item in region_gathering_points[i]:
-                        if len(item) == 3:  # 新格式：(node_id, geom, type)
-                            points_i.append(item[1])  # 添加几何点
-                        else:  # 兼容旧格式：(node_id, geom)
-                            points_i.append(item[1])
-
-                    # 区域j的点：需求点 + 一级集合点 + 二级集合点
-                    points_j = [geom_j]  # 先添加需求点
-                    for item in region_gathering_points[j]:
-                        if len(item) == 3:  # 新格式：(node_id, geom, type)
-                            points_j.append(item[1])  # 添加几何点
-                        else:  # 兼容旧格式：(node_id, geom)
-                            points_j.append(item[1])
-                    min_dist = float('inf')
-                    best_pair = None
-                    for pt1 in points_i:
-                        for pt2 in points_j:
-                            d = pt1.distance(pt2)
-                            if d < min_dist:
-                                min_dist = d
-                                best_pair = (pt1, pt2)
-                    if best_pair:
-                        line_between = LineString([best_pair[0], best_pair[1]])
-                        crossings = count_crossings(line_between, arterial_lines)
-                        ax.plot([best_pair[0].x, best_pair[1].x], [best_pair[0].y, best_pair[1].y],
-                                'k-', linewidth=2)
-                        mx, my = (best_pair[0].x + best_pair[1].x) / 2, (best_pair[0].y + best_pair[1].y) / 2
-                        ax.text(mx, my, str(crossings), fontsize=12, color='purple', weight='bold')
-
-            if len(edges) > 0:
-                edge_colors = []
-                edge_widths = []
-                for _, edge_data in edges.iterrows():
-                    if edge_data.get('arterial', False):
-                        edge_colors.append('black')
-                        edge_widths.append(4)
-                    else:
-                        edge_colors.append('blue')
-                        edge_widths.append(2)
-                edges.plot(ax=ax, color=edge_colors, linewidth=edge_widths)
-                selected_node_set = set([node for node in self.selected_nodes if node in self.selected_G.nodes()])
-                processed_pairs = set()
-                edge_lengths = {}
-                for u, v, k, data in self.selected_G.edges(keys=True, data=True):
-                    if (u, v) in processed_pairs or (v, u) in processed_pairs:
-                        continue
-                    if u in selected_node_set and v in selected_node_set:
-                        length = data.get('length', 0)
-                        edge_lengths[(u, v)] = length
-                        processed_pairs.add((u, v))
-                    elif u in selected_node_set or v in selected_node_set:
-                        red_node = u if u in selected_node_set else v
-                        other_node = v if red_node == u else u
-                        visited = {red_node, other_node}
-                        queue = [(other_node, red_node, data.get('length', 0))]
-                        while queue:
-                            current, start_red, current_length = queue.pop(0)
-                            for neighbor in self.selected_G.neighbors(current):
-                                if neighbor in visited:
-                                    continue
-                                edge_keys = list(self.selected_G.get_edge_data(current, neighbor).keys())
-                                if edge_keys:
-                                    edge_data2 = self.selected_G.get_edge_data(current, neighbor, edge_keys[0])
-                                    edge_length = edge_data2.get('length', 0)
-                                    total_length = current_length + edge_length
-                                    if neighbor in selected_node_set:
-                                        if ((start_red, neighbor) not in processed_pairs and
-                                                (neighbor, start_red) not in processed_pairs):
-                                            edge_lengths[(start_red, neighbor)] = total_length
-                                            processed_pairs.add((start_red, neighbor))
-                                        break
-                                    else:
-                                        visited.add(neighbor)
-                                        queue.append((neighbor, start_red, total_length))
-                for (u, v), length in edge_lengths.items():
-                    u_coords = (nodes.loc[u].geometry.x, nodes.loc[u].geometry.y)
-                    v_coords = (nodes.loc[v].geometry.x, nodes.loc[v].geometry.y)
-                    mid_x = (u_coords[0] + v_coords[0]) / 2
-                    mid_y = (u_coords[1] + v_coords[1]) / 2
-                    ax.text(mid_x, mid_y, f"{length:.1f}m",
-                            fontsize=9, color='green', backgroundcolor='white',
-                            ha='center', va='center', weight='bold')
-            if len(self.selected_nodes) > 0:
-                selected_node_ids = [node_id for node_id in self.selected_nodes if node_id in nodes.index]
-                if selected_node_ids:
-                    plot_nodes = nodes.loc[selected_node_ids]
-                    plot_nodes.plot(ax=ax, color='red', markersize=50)
-            # 显示一级集合点容量
-            for p_node in self.primary_gathering_points:
-                if p_node in nodes.index:
-                    p_geom = nodes.loc[p_node].geometry
-                    capacity = self.primary_capacities.get(p_node, None)
-                    if capacity is not None:
-                        ax.text(p_geom.x, p_geom.y + 15, f"P1: {capacity}", fontsize=10, color='darkgreen',
-                                weight='bold',
-                                ha='center', va='bottom',
-                                bbox=dict(facecolor='white', alpha=0.8, edgecolor='darkgreen',
-                                          boxstyle='round,pad=0.3'))
-
-            # 显示二级集合点容量
-            for p_node in self.secondary_gathering_points:
-                if p_node in nodes.index:
-                    p_geom = nodes.loc[p_node].geometry
-                    capacity = self.secondary_capacities.get(p_node, None)
-                    if capacity is not None:
-                        ax.text(p_geom.x, p_geom.y - 15, f"P2: {capacity}", fontsize=10, color='green',
-                                weight='bold',
-                                ha='center', va='top',
-                                bbox=dict(facecolor='white', alpha=0.8, edgecolor='green', boxstyle='round,pad=0.3'))
-
-            # Update the legend to include both geometric centroids and actual centroid nodes
-            from matplotlib.lines import Line2D
-            legend_elements = [
-                Line2D([0], [0], color='blue', linewidth=2, label='Regular Road'),
-                Line2D([0], [0], color='black', linewidth=4, label='Arterial Road'),
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=8, label='Selected Node'),
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='darkgreen', markersize=10, label='Primary GP'),
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgreen', markersize=10,
-                       label='Secondary GP'),
-                Line2D([0], [0], color='#FFEDA0', lw=10, alpha=0.4, label='Region'),
-                Line2D([0], [0], marker='^', color='w', markerfacecolor='orange', markeredgecolor='black',
-                       markersize=12, label='Demand Point'),
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=5, alpha=0.5,
-                       label='Geometric Centroid'),
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='lightblue', markersize=5, alpha=0.7,
-                       label='Interior Nodes'),
-                Line2D([0], [0], color='green', linestyle='--', linewidth=1.5, label='To Primary GP'),
-                Line2D([0], [0], color='cyan', linestyle='--', linewidth=1.5, label='To Secondary GP'),
-                Line2D([0], [0], color='black', linewidth=2, label='Adjacent Region Link')
-            ]
-            ax.legend(handles=legend_elements, loc='upper right')
-            ax.set_title(f'Selected Road Network - {self.location_name}')
-            plt.tight_layout()
-            plt.show()
-
-            # 新增：显示识别到的需求点信息
-            print(f"\n✅ 已识别 {len(self.region_centroid_nodes)} 个需求点")
-            for i, (node_id, geom) in enumerate(self.region_centroid_nodes):
-                print(f"需求点 {i + 1}: 节点 {node_id}")
-        except ValueError as e:
-            print(f"Error happens when selecting: {e}")
-            print(f"Total nodes: {len(self.selected_G.nodes)}")
-            print(f"Total edges: {self.selected_G.number_of_edges()}")
-        except Exception as e:
-            print(f"Error happens when getting the map: {e}")
-            import traceback
-            traceback.print_exc()
