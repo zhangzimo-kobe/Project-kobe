@@ -1,102 +1,3 @@
-    def _crossover(self, parent1: Dict, parent2: Dict) -> Tuple[Dict, Dict]:
-        """二点交叉操作"""
-        if random.random() > self.crossover_rate:
-            return self._copy_individual(parent1), self._copy_individual(parent2)
-
-        # 二点交叉
-        point1 = random.randint(1, self.num_demands - 2)
-        point2 = random.randint(point1 + 1, self.num_demands - 1)
-
-        # 低能人群分配交叉
-        child1_vuln = parent1['vulnerable_assignment'].copy()
-        child2_vuln = parent2['vulnerable_assignment'].copy()
-        child1_vuln[point1:point2] = parent2['vulnerable_assignment'][point1:point2]
-        child2_vuln[point1:point2] = parent1['vulnerable_assignment'][point1:point2]
-
-        # 健全人群分配交叉
-        child1_able = parent1['able_assignment'].copy()
-        child2_able = parent2['able_assignment'].copy()
-        child1_able[point1:point2] = parent2['able_assignment'][point1:point2]
-        child2_able[point1:point2] = parent1['able_assignment'][point1:point2]
-
-        # 构建子代
-        child1 = {
-            'vulnerable_assignment': child1_vuln,
-            'able_assignment': child1_able
-        }
-        child2 = {
-            'vulnerable_assignment': child2_vuln,
-            'able_assignment': child2_able
-        }
-
-        # 修复不可行解
-        child1 = self._repair_individual(child1)
-        child2 = self._repair_individual(child2)
-
-        return child1, child2
-
-    def _mutate(self, individual: Dict) -> Dict:
-        """变异操作"""
-        if random.random() > self.mutation_rate:
-            return self._copy_individual(individual)
-
-        mutated = self._copy_individual(individual)
-
-        # 随机选择变异类型：0=低能人群，1=健全人群
-        mutation_type = random.randint(0, 1)
-
-        if mutation_type == 0 and self.num_primary_gp > 1:
-            # === 变异低能人群分配（只能在一级集合点之间切换）===
-            # 找到有低能人群需求的需求点
-            valid_demands = [i for i in range(self.num_demands) if self.vulnerable_demands[i] > 0]
-
-            if valid_demands:
-                i = random.choice(valid_demands)
-                current_j = mutated['vulnerable_assignment'][i]
-
-                # 找可行的一级集合点
-                feasible = []
-                for j in range(self.num_primary_gp):
-                    if j != current_j and self.primary_distance_matrix[i, j] <= self.dmax:
-                        feasible.append(j)
-
-                if feasible:
-                    mutated['vulnerable_assignment'][i] = random.choice(feasible)
-
-        else:
-            # === 变异健全人群分配（可以切换到一级或二级）===
-            # 找到有健全人群需求的需求点
-            valid_demands = [i for i in range(self.num_demands) if self.able_demands[i] > 0]
-
-            if valid_demands:
-                i = random.choice(valid_demands)
-                current = mutated['able_assignment'][i]
-
-                # 找可行的集合点
-                feasible = []
-
-                # 检查一级集合点
-                for j in range(self.num_primary_gp):
-                    if self.primary_distance_matrix[i, j] <= self.dmax:
-                        option = ('primary', j)
-                        if current != option:
-                            feasible.append(option)
-
-                # 检查二级集合点
-                for j in range(self.num_secondary_gp):
-                    if self.secondary_distance_matrix[i, j] <= self.dmax:
-                        option = ('secondary', j)
-                        if current != option:
-                            feasible.append(option)
-
-                if feasible:
-                    mutated['able_assignment'][i] = random.choice(feasible)
-
-        # 修复可能的不可行解
-        mutated = self._repair_individual(mutated)
-
-        return mutated
-
     def _repair_individual(self, individual: Dict) -> Dict:
         """修复不可行个体"""
         repaired = self._copy_individual(individual)
@@ -362,36 +263,68 @@
         print(f"\nDistance limit: {self.dmax:.1f}m (Terrain type: {self.terrain_type})")
         print(f"\n算法运行完成，耗时 {runtime:.2f} 秒")
         print(f"最终帕累托前沿包含 {len(self.pareto_front)} 个解")
-        print(f"\n" + "帕累托最优解详情（共 {len(self.pareto_front)} 个解）")
+        print(f"\n帕累托最优解详情（共 {len(self.pareto_front)} 个解）")
         for idx, solution in enumerate(self.pareto_front):
-            assignment = solution['assignment']
+            vulnerable_assignment = solution['vulnerable_assignment']
+            able_assignment = solution['able_assignment']
             obj1, obj2 = solution['objectives']
-            # 找出使用的集合点
-            used_gps_indices = sorted(set(assignment[assignment != -1]))
-            used_gps_numbers = [self.gathering_numbers[j] for j in used_gps_indices]
+
             print(f"\n【解 {idx + 1}】")
-            print(f"  总距离: {obj1:.0f} 人·米")
-            print(f"  总穿越: {obj2:.0f} 次")
-            print(f"  使用集合点数量: {len(used_gps_indices)}/{self.num_gathering}")
-            print(f"  使用的集合点: {used_gps_numbers}")
-            print(f"  各集合点负载:")
-            for j in sorted(used_gps_indices):
-                gp_num = self.gathering_numbers[j]
-                assigned_to_j = np.where(assignment == j)[0]
-                total_load = np.sum(self.demands[assigned_to_j])
-                capacity = self.capacities[j]
-                utilization = total_load / capacity * 100
-                print(f"    集合点{gp_num}: {total_load:.0f}/{capacity:.0f}人 ({utilization:.1f}%)")
+            print(f"  总加权距离: {obj1:.0f} 人·米")
+            print(f"  总加权穿越: {obj2:.0f} 人·次")
+
+            # 统计一级集合点使用情况
+            primary_load = np.zeros(self.num_primary_gp)
+            for i in range(self.num_demands):
+                j = vulnerable_assignment[i]
+                if j != -1:
+                    primary_load[j] += self.vulnerable_demands[i]
+                assign = able_assignment[i]
+                if assign is not None and assign[0] == 'primary':
+                    primary_load[assign[1]] += self.able_demands[i]
+
+            used_primary = [j for j in range(self.num_primary_gp) if primary_load[j] > 0]
+            print(f"  使用一级集合点: {len(used_primary)}/{self.num_primary_gp}")
+            for j in used_primary:
+                utilization = primary_load[j] / self.primary_capacities[j] * 100
+                print(
+                    f"    一级{j + 1}: {primary_load[j]:.0f}/{self.primary_capacities[j]:.0f}人 ({utilization:.1f}%)")
+
+            # 统计二级集合点使用情况
+            if self.num_secondary_gp > 0:
+                secondary_load = np.zeros(self.num_secondary_gp)
+                for i in range(self.num_demands):
+                    assign = able_assignment[i]
+                    if assign is not None and assign[0] == 'secondary':
+                        secondary_load[assign[1]] += self.able_demands[i]
+
+                used_secondary = [j for j in range(self.num_secondary_gp) if secondary_load[j] > 0]
+                print(f"  使用二级集合点: {len(used_secondary)}/{self.num_secondary_gp}")
+                for j in used_secondary:
+                    utilization = secondary_load[j] / self.secondary_capacities[j] * 100
+                    print(
+                        f"    二级{j + 1}: {secondary_load[j]:.0f}/{self.secondary_capacities[j]:.0f}人 ({utilization:.1f}%)")
+
         print(f"\n" + "=" * 60)
         return self.pareto_front
 
-    def visualize_results(self, results: Dict):
+    def visualize_results(self, results: Dict = None):
         """
         结果可视化
 
         Args:
-            results: 优化结果
+            results: 优化结果（可选，默认使用内部数据）
         """
+        # 如果没有传入 results，使用内部数据
+        if results is None:
+            if not self.pareto_front:
+                print("没有可视化的帕累托解")
+                return
+            results = {
+                'pareto_front': self.pareto_front,
+                'history': self.history
+            }
+
         # 创建图形窗口
         fig, axes = plt.subplots(2, 2, figsize=(16, 14))
 
@@ -401,97 +334,106 @@
         distances = [obj[0] for obj in pareto_objectives]
         crossings = [obj[1] for obj in pareto_objectives]
         ax1.scatter(distances, crossings, c='blue', s=50, alpha=0.7)
-        ax1.set_xlabel('加权总步行距离 (m)', fontsize=12)
-        ax1.set_ylabel('加权总穿越次数', fontsize=12)
+        ax1.set_xlabel('加权总步行距离 (人·米)', fontsize=12)
+        ax1.set_ylabel('加权总穿越次数 (人·次)', fontsize=12)
         ax1.set_title('Pareto 前沿', fontsize=14)
         ax1.grid(True, alpha=0.3)
 
-        # 子图2：最佳分配方案可视化
+        # 子图2：选择最佳解（距离最小的）进行展示
         ax2 = axes[0, 1]
-        best_solution = results['best_solution']
+        best_idx = np.argmin(distances)
+        best_solution = results['pareto_front'][best_idx]
+
+        # 使用正确的属性获取节点位置
+        nodes_gdf = self.road_network.nodes
+
+        # 绘制需求点
+        for i, node_id in enumerate(self.demand_nodes):
+            if node_id in nodes_gdf.index:
+                geom = nodes_gdf.loc[node_id].geometry
+                ax2.scatter(geom.x, geom.y, c='red', s=80, marker='o', zorder=5)
+                ax2.annotate(f'D{i + 1}', (geom.x, geom.y), fontsize=8, xytext=(5, 5), textcoords='offset points')
+
+        # 绘制一级集合点
+        for j, node_id in enumerate(self.primary_gp_nodes):
+            if node_id in nodes_gdf.index:
+                geom = nodes_gdf.loc[node_id].geometry
+                ax2.scatter(geom.x, geom.y, c='darkgreen', s=150, marker='s', zorder=5)
+                ax2.annotate(f'P1-{j + 1}', (geom.x, geom.y), fontsize=8, xytext=(5, 5), textcoords='offset points')
+
+        # 绘制二级集合点
+        for j, node_id in enumerate(self.secondary_gp_nodes):
+            if node_id in nodes_gdf.index:
+                geom = nodes_gdf.loc[node_id].geometry
+                ax2.scatter(geom.x, geom.y, c='lightgreen', s=120, marker='^', zorder=5)
+                ax2.annotate(f'P2-{j + 1}', (geom.x, geom.y), fontsize=8, xytext=(5, 5), textcoords='offset points')
+
+        # 绘制分配连线
         vulnerable_assignment = best_solution['vulnerable_assignment']
         able_assignment = best_solution['able_assignment']
 
-        # 绘制道路网络
-        pos = nx.get_node_attributes(self.road_network.network, 'pos')
-        nx.draw_networkx(self.road_network.network, pos, ax=ax2,
-                         node_size=20, node_color='lightgray',
-                         edge_color='gray', alpha=0.3, with_labels=False)
+        for i, node_id in enumerate(self.demand_nodes):
+            if node_id not in nodes_gdf.index:
+                continue
+            demand_geom = nodes_gdf.loc[node_id].geometry
 
-        # 绘制需求点
-        demand_x = [pos[n][0] for n in self.demand_nodes]
-        demand_y = [pos[n][1] for n in self.demand_nodes]
-        ax2.scatter(demand_x, demand_y, c='red', s=50, marker='o', label='需求点', zorder=5)
-
-        # 绘制一级集合点
-        primary_x = [pos[n][0] for n in self.primary_gp_nodes]
-        primary_y = [pos[n][1] for n in self.primary_gp_nodes]
-        ax2.scatter(primary_x, primary_y, c='green', s=100, marker='s', label='一级集合点', zorder=5)
-
-        # 绘制二级集合点
-        if self.num_secondary_gp > 0:
-            secondary_x = [pos[n][0] for n in self.secondary_gp_nodes]
-            secondary_y = [pos[n][1] for n in self.secondary_gp_nodes]
-            ax2.scatter(secondary_x, secondary_y, c='orange', s=100, marker='^', label='二级集合点', zorder=5)
-
-        # 绘制低能人群分配连线（红色虚线）
-        for i, demand_node in enumerate(self.demand_nodes):
+            # 低能人群分配线（红色虚线）
             j = vulnerable_assignment[i]
             if j != -1 and self.vulnerable_demands[i] > 0:
                 gp_node = self.primary_gp_nodes[j]
-                ax2.plot([pos[demand_node][0], pos[gp_node][0]],
-                         [pos[demand_node][1], pos[gp_node][1]],
-                         c='red', alpha=0.6, linewidth=1.5, linestyle = '--')
+                if gp_node in nodes_gdf.index:
+                    gp_geom = nodes_gdf.loc[gp_node].geometry
+                    ax2.plot([demand_geom.x, gp_geom.x], [demand_geom.y, gp_geom.y],
+                             'r--', alpha=0.6, linewidth=1.5)
 
-                # 绘制健全人群分配连线（蓝色实线）
-                for i, demand_node in enumerate(self.demand_nodes):
+                    # 健全人群分配线（蓝色或紫色实线）
                     assign = able_assignment[i]
                     if assign is not None and self.able_demands[i] > 0:
-                        gp_type, j = assign
+                        gp_type, j_able = assign
                         if gp_type == 'primary':
-                            gp_node = self.primary_gp_nodes[j]
+                            gp_node = self.primary_gp_nodes[j_able]
                             color = 'blue'
                         else:
-                            gp_node = self.secondary_gp_nodes[j]
+                            gp_node = self.secondary_gp_nodes[j_able]
                             color = 'purple'
-                        ax2.plot([pos[demand_node][0], pos[gp_node][0]],
-                                 [pos[demand_node][1], pos[gp_node][1]],
-                                 c=color, alpha=0.5, linewidth=1)
+                        if gp_node in nodes_gdf.index:
+                            gp_geom = nodes_gdf.loc[gp_node].geometry
+                            ax2.plot([demand_geom.x, gp_geom.x], [demand_geom.y, gp_geom.y],
+                                     c=color, alpha=0.5, linewidth=1)
 
-                ax2.set_title(f'最佳分配方案\n加权距离: {best_solution["objectives"][0]:.1f}m, '
-                              f'加权穿越: {best_solution["objectives"][1]:. 1f}', fontsize=12)
-                ax2.legend(loc='upper right')
+                ax2.set_title(f'最佳分配方案\n加权距离: {best_solution["objectives"][0]:.1f}, '
+                              f'加权穿越: {best_solution["objectives"][1]:.1f}', fontsize=12)
 
-                # 添加图例说明
+                # 添加图例
                 legend_elements = [
-                    Line2D([0], [0], color='red', linestyle='--', label='低能人群→一级'),
-                    Line2D([0], [0], color='blue', linestyle='-', label='健全人群→一级'),
-                    Line2D([0], [0], color='purple', linestyle='-', label='健全人群→二级')
+                Line2D([0], [0], color='red', linestyle='--', linewidth=1.5, label = '低能人群→一级'),
+                Line2D([0], [0], color='blue', linestyle='-', linewidth=1, label='健全人群→一级'),
+                Line2D([0], [0], color='purple', linestyle='-', linewidth=1, label='健全人群→二级'),
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=8, label='需求点'),
+                Line2D([0], [0], marker='s', color='w', markerfacecolor='darkgreen', markersize=10, label='一级集合点'),
+                Line2D([0], [0], marker='^', color='w', markerfacecolor='lightgreen', markersize=10, label='二级集合点'),
                 ]
-                ax2.legend(handles=legend_elements, loc='lower right')
+                ax2.legend(handles=legend_elements, loc='upper right', fontsize=8)
 
                 # 子图3：收敛曲线 - 距离
                 ax3 = axes[1, 0]
-                ax3.plot(results['history']['generations'],
-                         results['history']['avg_distance'], 'b-', linewidth=2)
+                ax3.plot(self.history['generation'], self.history['best_obj1'], 'b-', linewidth=2)
                 ax3.set_xlabel('迭代次数', fontsize=12)
-                ax3.set_ylabel('平均加权距离 (m)', fontsize=12)
+                ax3.set_ylabel('最佳加权距离 (人·米)', fontsize=12)
                 ax3.set_title('收敛曲线 - 步行距离', fontsize=14)
                 ax3.grid(True, alpha=0.3)
 
                 # 子图4：收敛曲线 - 穿越次数
                 ax4 = axes[1, 1]
-                ax4.plot(results['history']['generations'],
-                         results['history']['avg_crossings'], 'r-', linewidth=2)
+                ax4.plot(self.history['generation'], self.history['best_obj2'], 'r-', linewidth=2)
                 ax4.set_xlabel('迭代次数', fontsize=12)
-                ax4.set_ylabel('平均加权穿越次数', fontsize=12)
+                ax4.set_ylabel('最佳加权穿越次数 (人·次)', fontsize=12)
                 ax4.set_title('收敛曲线 - 穿越次数', fontsize=14)
                 ax4.grid(True, alpha=0.3)
 
                 plt.tight_layout()
                 plt.savefig('nsga2_results.png', dpi=150, bbox_inches='tight')
                 plt.show()
-
                 print(f"\n优化结果已保存为 'nsga2_results.png'")
 
     def export_results(self, filename: str = "pareto_solutions.csv"):
@@ -609,12 +551,17 @@ def run_optimization(road_network_selector,
 
         # 运行算法
         pareto_solutions = ga.run()
+        if pareto_solutions and len(pareto_solutions) > 0:
+            try:
+                ga.visualize_results()
+            except Exception as e:
+                print(f"可视化时出现警告: {e}")
 
-        # 可视化结果
-        ga.visualize_results()
-
-        # 导出结果
-        ga.export_results()
+            # 导出结果
+            try:
+                ga.export_results()
+            except Exception as e:
+                print(f"导出结果时出现警告: {e}")
 
         return ga, pareto_solutions
 
