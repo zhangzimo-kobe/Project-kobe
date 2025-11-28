@@ -1,0 +1,1150 @@
+import numpy as np
+import networkx as nx
+import matplotlib. pyplot as plt
+from matplotlib.lines import Line2D
+import random
+from typing import List, Tuple, Dict
+import time
+import pandas as pd
+
+
+class MultiObjectiveGA:
+    def __init__(self, road_network,
+                 population_size: int = 100,
+                 max_generations: int = 200,
+                 crossover_rate: float = 0.8,
+                 mutation_rate: float = 0.1,
+                 terrain_type: str = 'flat',
+                 elevation_factor: float = 1.0,
+                 road_condition_factor: float = 1.0,
+                 vulnerable_weight: float = 1.5
+                 ):
+        self.road_network = road_network
+        self.population_size = population_size
+        self.max_generations = max_generations
+        self.crossover_rate = crossover_rate
+        self.mutation_rate = mutation_rate
+        self.terrain_type = terrain_type
+        self.elevation_factor = elevation_factor
+        self.road_condition_factor = road_condition_factor
+        self.vulnerable_weight = vulnerable_weight  # 低能人群权重
+        self.dmax = self._calculate_terrain_based_dmax()
+
+        # 提取问题数据
+        self._extract_problem_data()
+
+        # 算法状态
+        self.population = []
+        self.pareto_front = []
+        self.generation = 0
+        self.history = {
+            'best_obj1': [],
+            'best_obj2': [],
+            'pareto_size': [],
+            'generation': []
+        }
+        print(f"\nGA 初始化完成")
+        print(f"需求点数量: {self.num_demands}")
+        print(f"一级集合点数量: {self.num_primary_gp}")
+        print(f"二级集合点数量: {self.num_secondary_gp}")
+        print(f"低能人群权重: {self.vulnerable_weight}")
+        print(f"种群大小: {self.population_size}")
+        print(f"最大迭代次数: {self.max_generations}")
+
+    def _extract_problem_data(self):
+        """从路网选择器中提取问题数据"""
+        # 检查必要数据
+        if not hasattr(self.road_network, 'region_centroid_nodes') or not self.road_network.region_centroid_nodes:
+            raise ValueError("Demand point not found，finish the network selection first.")
+
+        if not self.road_network.primary_gathering_points:
+            raise ValueError("未找到一级集合点，低能人群必须有一级集合点接收")
+
+        if not hasattr(self.road_network,
+                       'primary_distance_matrix') or self.road_network.primary_distance_matrix is None:
+            raise ValueError("未找到一级集合点距离矩阵，请先计算距离")
+
+        if not self.road_network.vulnerable_demand and not self.road_network.able_bodied_demand:
+            raise ValueError("未找到需求量数据，请先输入需求量")
+
+        # 提取需求点信息
+        self.demand_nodes = [node_id for node_id, _ in self.road_network.region_centroid_nodes]
+        self.num_demands = len(self.demand_nodes)
+
+        # 提取一级集合点信息
+        self.primary_gp_nodes = sorted(list(self.road_network.primary_gathering_points))
+        self.num_primary_gp = len(self.primary_gp_nodes)
+
+        # 提取二级集合点信息
+        self.secondary_gp_nodes = sorted(list(self.road_network.secondary_gathering_points))
+        self.num_secondary_gp = len(self.secondary_gp_nodes)
+
+        # 提取低能人群需求量
+        self.vulnerable_demands = np.array([
+            self.road_network.vulnerable_demand.get(node, 0)
+            for node in self.demand_nodes
+        ])
+
+        # 提取健全人群需求量
+        self.able_demands = np.array([
+            self.road_network.able_bodied_demand.get(node, 0)
+            for node in self.demand_nodes
+        ])
+
+        # 提取一级集合点容量
+        self.primary_capacities = np.array([
+            self.road_network.primary_capacities.get(node, 0)
+            for node in self.primary_gp_nodes
+        ])
+
+        # 提取二级集合点容量
+        if self.num_secondary_gp > 0:
+            self.secondary_capacities = np.array([
+                self.road_network.secondary_capacities.get(node, 0)
+                for node in self.secondary_gp_nodes
+            ])
+        else:
+            self.secondary_capacities = np.array([])
+
+        # 提取一级集合点距离矩阵
+        primary_df = self.road_network.primary_distance_matrix
+        self.primary_distance_matrix = np.full((self.num_demands, self.num_primary_gp), np.inf)
+        for i, demand_node in enumerate(self.demand_nodes):
+            for j, gp_node in enumerate(self.primary_gp_nodes):
+                if demand_node in primary_df.index and gp_node in primary_df.columns:
+                    distance = primary_df.loc[demand_node, gp_node]
+                    if not np.isinf(distance) and distance <= self.dmax:
+                        self.primary_distance_matrix[i, j] = distance
+
+        print(f"一级距离矩阵构建完成，距离限制: {self.dmax:. 1f}m")
+
+        # 提取二级集合点距离矩阵
+        if self.num_secondary_gp > 0 and self.road_network.secondary_distance_matrix is not None:
+            secondary_df = self.road_network.secondary_distance_matrix
+            self.secondary_distance_matrix = np.full((self.num_demands, self.num_secondary_gp), np.inf)
+            for i, demand_node in enumerate(self.demand_nodes):
+                for j, gp_node in enumerate(self.secondary_gp_nodes):
+                    if demand_node in secondary_df.index and gp_node in secondary_df.columns:
+                        distance = secondary_df.loc[demand_node, gp_node]
+                        if not np.isinf(distance) and distance <= self.dmax:
+                            self.secondary_distance_matrix[i, j] = distance
+            print(f"二级距离矩阵构建完成")
+        else:
+            self.secondary_distance_matrix = np.full((self.num_demands, 0), np.inf)
+
+        # 提取穿越次数矩阵
+        self.primary_crossing_matrix = self._get_primary_crossing_matrix()
+        self.secondary_crossing_matrix = self._get_secondary_crossing_matrix()
+
+        print(f"\n数据提取完成:")
+        print(f"  需求点: {self.demand_nodes}")
+        print(f"  一级集合点: {self.primary_gp_nodes}")
+        print(f"  二级集合点: {self.secondary_gp_nodes}")
+        print(f"  低能人群需求: {self.vulnerable_demands}")
+        print(f"  健全人群需求: {self.able_demands}")
+        print(f"  一级容量: {self.primary_capacities}")
+        print(f"  二级容量: {self.secondary_capacities}")
+        print(f"  总低能人群: {np.sum(self.vulnerable_demands)}")
+        print(f"  总健全人群: {np.sum(self.able_demands)}")
+        print(f"  总一级容量: {np.sum(self.primary_capacities)}")
+        print(f"  总二级容量: {np.sum(self.secondary_capacities) if self.num_secondary_gp > 0 else 0}")
+
+
+    def _calculate_terrain_based_dmax(self) -> float:
+        """
+        根据地形类型、海拔和路况计算距离限制
+
+        Returns:
+            float: 计算后的距离限制
+        """
+        # 地形类型基础距离（米）
+        terrain_base_distances = {
+            'flat': 1500,  # 平原：1500米
+            'hilly': 1200,  # 丘陵：1200米
+        '   mountainous': 900  # 山区：900米
+        }
+
+        # 获取地形基础距离
+        base_distance = terrain_base_distances.get(self.terrain_type, 1500)
+
+        # 应用海拔和路况调整
+        adjusted_distance = base_distance * self.elevation_factor * self.road_condition_factor
+
+        # 限制在合理范围内（500-2000米）
+        adjusted_distance = max(500, min(adjusted_distance, 2000))
+
+        print(f"\nTerrain-based distance limit calculation:")
+        print(f"  Terrain type: {self.terrain_type}")
+        print(f"  Base distance: {base_distance:.1f}m")
+        print(f"  Elevation factor: {self.elevation_factor}")
+        print(f"  Road condition factor: {self.road_condition_factor}")
+        print(f"  Final distance limit: {adjusted_distance:.1f}m")
+
+        return adjusted_distance
+
+    def _get_primary_crossing_matrix(self):
+        """获取一级集合点穿越次数矩阵"""
+        if hasattr(self.road_network,
+                   'primary_crossing_matrix') and self.road_network.primary_crossing_matrix is not None:
+            return self.road_network.primary_crossing_matrix
+        else:
+            print("警告: 未找到一级穿越矩阵，使用零矩阵")
+            return np.zeros((self.num_demands, self.num_primary_gp))
+
+    def _get_secondary_crossing_matrix(self):
+        """获取二级集合点穿越次数矩阵"""
+        if self.num_secondary_gp > 0:
+            if hasattr(self.road_network,
+                       'secondary_crossing_matrix') and self.road_network.secondary_crossing_matrix is not None:
+                return self.road_network.secondary_crossing_matrix
+            else:
+                print("警告: 未找到二级穿越矩阵，使用零矩阵")
+                return np.zeros((self.num_demands, self.num_secondary_gp))
+        else:
+            return np.zeros((self.num_demands, 0))
+
+    def _is_feasible_assignment(self, individual: Dict) -> bool:
+        """
+        检查分配方案是否可行
+
+        Args:
+            individual: 包含 vulnerable_assignment 和 able_assignment 的字典
+
+        Returns:
+            bool: 是否可行
+        """
+        vulnerable_assignment = individual['vulnerable_assignment']
+        able_assignment = individual['able_assignment']
+
+        # 计算一级集合点负载
+        primary_load = np.zeros(self.num_primary_gp)
+        for i in range(self.num_demands):
+            # 低能人群负载
+            j_vuln = vulnerable_assignment[i]
+            if j_vuln != -1:
+                primary_load[j_vuln] += self.vulnerable_demands[i]
+
+            # 健全人群到一级的负载
+            assign = able_assignment[i]
+            if assign is not None and assign[0] == 'primary':
+                primary_load[assign[1]] += self.able_demands[i]
+
+        # 检查一级容量约束
+        for j in range(self.num_primary_gp):
+            if primary_load[j] > self.primary_capacities[j]:
+                return False
+
+        # 计算二级集合点负载
+        if self.num_secondary_gp > 0:
+            secondary_load = np.zeros(self.num_secondary_gp)
+            for i in range(self.num_demands):
+                assign = able_assignment[i]
+                if assign is not None and assign[0] == 'secondary':
+                    secondary_load[assign[1]] += self.able_demands[i]
+
+            # 检查二级容量约束
+            for j in range(self.num_secondary_gp):
+                if secondary_load[j] > self.secondary_capacities[j]:
+                    return False
+
+        # 检查低能人群距离约束（只能到一级）
+        for i in range(self.num_demands):
+            j = vulnerable_assignment[i]
+            if j != -1 and self.primary_distance_matrix[i, j] > self.dmax:
+                return False
+
+        # 检查健全人群距离约束
+        for i in range(self.num_demands):
+            assign = able_assignment[i]
+            if assign is not None:
+                gp_type, j = assign
+                if gp_type == 'primary':
+                    if self.primary_distance_matrix[i, j] > self.dmax:
+                        return False
+                else:  # secondary
+                    if self.secondary_distance_matrix[i, j] > self.dmax:
+                        return False
+
+        return True
+
+    def _generate_random_individual(self) -> Dict:
+        """
+        生成一个随机的可行个体
+
+        Returns:
+            Dict: 包含 vulnerable_assignment 和 able_assignment 的字典
+                  - vulnerable_assignment: np.array, 低能人群分配到一级集合点的索引
+                  - able_assignment: list, 健全人群分配，元素为 ('primary', j) 或 ('secondary', j)
+        """
+        max_attempts = 100
+
+        for attempt in range(max_attempts):
+            # 初始化分配
+            vulnerable_assignment = np.full(self.num_demands, -1)
+            able_assignment = [None] * self.num_demands
+
+            # 跟踪剩余容量
+            primary_remaining = self.primary_capacities.copy().astype(float)
+            if self.num_secondary_gp > 0:
+                secondary_remaining = self.secondary_capacities.copy().astype(float)
+            else:
+                secondary_remaining = np.array([])
+
+            # 随机排列需求点顺序
+            demand_order = np.random.permutation(self.num_demands)
+
+            success = True
+            for i in demand_order:
+                vuln_demand = self.vulnerable_demands[i]
+                able_demand = self.able_demands[i]
+
+                # === 步骤1: 分配低能人群到一级集合点 ===
+                if vuln_demand > 0:
+                    feasible_primary = []
+                    for j in range(self.num_primary_gp):
+                        if (self.primary_distance_matrix[i, j] <= self.dmax and
+                                primary_remaining[j] >= vuln_demand):
+                            feasible_primary.append(j)
+
+                    if feasible_primary:
+                        j = random.choice(feasible_primary)
+                        vulnerable_assignment[i] = j
+                        primary_remaining[j] -= vuln_demand
+                    else:
+                        # 低能人群无法分配，重新开始
+                        success = False
+                        break
+
+                # === 步骤2: 分配健全人群到一级或二级集合点 ===
+                if able_demand > 0:
+                    feasible_options = []
+
+                    # 检查一级集合点
+                    for j in range(self.num_primary_gp):
+                        if (self.primary_distance_matrix[i, j] <= self.dmax and
+                                primary_remaining[j] >= able_demand):
+                            feasible_options.append(('primary', j))
+
+                    # 检查二级集合点
+                    for j in range(self.num_secondary_gp):
+                        if (self.secondary_distance_matrix[i, j] <= self.dmax and
+                                secondary_remaining[j] >= able_demand):
+                            feasible_options.append(('secondary', j))
+
+                    if feasible_options:
+                        choice = random.choice(feasible_options)
+                        able_assignment[i] = choice
+                        if choice[0] == 'primary':
+                            primary_remaining[choice[1]] -= able_demand
+                        else:
+                            secondary_remaining[choice[1]] -= able_demand
+                    else:
+                        # 健全人群无法分配，重新开始
+                        success = False
+                        break
+
+            # 检查是否成功
+            if success:
+                # 验证所有有需求的点都已分配
+                all_assigned = True
+                for i in range(self.num_demands):
+                    if self.vulnerable_demands[i] > 0 and vulnerable_assignment[i] == -1:
+                        all_assigned = False
+                        break
+                    if self.able_demands[i] > 0 and able_assignment[i] is None:
+                        all_assigned = False
+                        break
+
+                if all_assigned:
+                    return {
+                        'vulnerable_assignment': vulnerable_assignment,
+                        'able_assignment': able_assignment
+                    }
+
+        raise ValueError("无法生成可行解，请检查容量约束是否满足")
+
+    def _calculate_objectives(self, individual: Dict) -> Tuple[float, float]:
+        """
+        计算目标函数值（低能人群带权重）
+
+        Args:
+            individual: 包含 vulnerable_assignment 和 able_assignment 的字典
+
+        Returns:
+            Tuple[float, float]: (加权总步行距离, 加权总穿越次数)
+        """
+        vulnerable_assignment = individual['vulnerable_assignment']
+        able_assignment = individual['able_assignment']
+
+        total_distance = 0.0
+        total_crossings = 0.0
+
+        for i in range(self.num_demands):
+            # === 低能人群（带权重）===
+            j_vuln = vulnerable_assignment[i]
+            if j_vuln != -1 and self.vulnerable_demands[i] > 0:
+                distance = self.primary_distance_matrix[i, j_vuln]
+                crossing = self.primary_crossing_matrix[i, j_vuln]
+                # 带权重计算
+                total_distance += self.vulnerable_weight * self.vulnerable_demands[i] * distance
+                total_crossings += self.vulnerable_weight * self.vulnerable_demands[i] * crossing
+
+            # === 健全人群（无权重）===
+            assign_info = able_assignment[i]
+            if assign_info is not None and self.able_demands[i] > 0:
+                gp_type, j_able = assign_info
+                if gp_type == 'primary':
+                    distance = self.primary_distance_matrix[i, j_able]
+                    crossing = self.primary_crossing_matrix[i, j_able]
+                else:  # secondary
+                    distance = self.secondary_distance_matrix[i, j_able]
+                    crossing = self.secondary_crossing_matrix[i, j_able]
+                # 无权重计算
+                total_distance += self.able_demands[i] * distance
+                total_crossings += self.able_demands[i] * crossing
+
+        return total_distance, total_crossings
+
+    def _dominates(self, obj1: Tuple[float, float], obj2: Tuple[float, float]) -> bool:
+        """
+        判断目标1是否支配目标2
+
+        Args:
+            obj1: 目标函数值1
+            obj2: 目标函数值2
+
+        Returns:
+            bool: obj1是否支配obj2
+        """
+        return (obj1[0] <= obj2[0] and obj1[1] <= obj2[1] and
+                (obj1[0] < obj2[0] or obj1[1] < obj2[1]))
+
+    def _initialize_population(self):
+        """初始化种群"""
+        print("正在初始化种群...")
+        self.population = []
+
+        for i in range(self.population_size):
+            if i % 20 == 0:
+                print(f"  生成个体 {i + 1}/{self.population_size}")
+
+            individual = self._generate_random_individual()
+            objectives = self._calculate_objectives(individual)
+
+            self.population.append({
+                'vulnerable_assignment': individual['vulnerable_assignment'],
+                'able_assignment': individual['able_assignment'],
+                'objectives': objectives,
+                'rank': 0,
+                'crowding_distance': 0.0
+            })
+
+        print(f"种群初始化完成，共 {len(self.population)} 个个体")
+
+    def _fast_non_dominated_sort(self):
+        """快速非支配排序"""
+        fronts = [[]]
+
+        for i, individual_i in enumerate(self.population):
+            individual_i['domination_count'] = 0
+            individual_i['dominated_solutions'] = []
+            for j, individual_j in enumerate(self.population):
+                if i != j:
+                    if self._dominates(individual_i['objectives'], individual_j['objectives']):
+                        individual_i['dominated_solutions'].append(j)
+                    elif self._dominates(individual_j['objectives'], individual_i['objectives']):
+                        individual_i['domination_count'] += 1
+
+            if individual_i['domination_count'] == 0:
+                individual_i['rank'] = 0
+                fronts[0].append(i)
+
+        i = 0
+        while len(fronts[i]) > 0:
+            next_front = []
+            for p in fronts[i]:
+                for q in self.population[p]['dominated_solutions']:
+                    self.population[q]['domination_count'] -= 1
+                    if self.population[q]['domination_count'] == 0:
+                        self.population[q]['rank'] = i + 1
+                        next_front.append(q)
+            i += 1
+            fronts.append(next_front)
+
+        return fronts[:-1]
+
+    def _calculate_crowding_distance(self, front: List[int]):
+        """计算拥挤度距离"""
+        if len(front) <= 2:
+            for i in front:
+                self.population[i]['crowding_distance'] = np.inf
+            return
+
+        # 初始化距离
+        for i in front:
+            self.population[i]['crowding_distance'] = 0.0
+
+        # 对每个目标函数
+        for obj_idx in range(2):
+            # 按目标函数值排序
+            front.sort(key=lambda x: self.population[x]['objectives'][obj_idx])
+
+            # 边界点设为无穷大
+            self.population[front[0]]['crowding_distance'] = np.inf
+            self.population[front[-1]]['crowding_distance'] = np.inf
+
+            # 计算目标函数范围
+            obj_min = self.population[front[0]]['objectives'][obj_idx]
+            obj_max = self.population[front[-1]]['objectives'][obj_idx]
+            obj_range = obj_max - obj_min
+
+            if obj_range > 0:
+                for i in range(1, len(front) - 1):
+                    distance = (self.population[front[i + 1]]['objectives'][obj_idx] -
+                                self.population[front[i - 1]]['objectives'][obj_idx]) / obj_range
+                    self.population[front[i]]['crowding_distance'] += distance
+
+    def _tournament_selection(self) -> int:
+        """锦标赛选择"""
+        tournament_size = 2  # 二元锦标赛
+        tournament = random.sample(range(len(self.population)), tournament_size)
+        best = tournament[0]
+        for i in tournament[1:]:
+            # 比较等级
+            if self.population[i]['rank'] < self.population[best]['rank']:
+                best = i
+            elif (self.population[i]['rank'] == self.population[best]['rank'] and
+                  self.population[i]['crowding_distance'] > self.population[best]['crowding_distance']):
+                best = i
+
+        return best
+
+    def _crossover(self, parent1: Dict, parent2: Dict) -> Tuple[Dict, Dict]:
+        """二点交叉操作"""
+        if random.random() > self.crossover_rate:
+            return self._copy_individual(parent1), self._copy_individual(parent2)
+
+        # 二点交叉
+        point1 = random.randint(1, self.num_demands - 2)
+        point2 = random.randint(point1 + 1, self.num_demands - 1)
+
+        # 低能人群分配交叉
+        child1_vuln = parent1['vulnerable_assignment'].copy()
+        child2_vuln = parent2['vulnerable_assignment'].copy()
+        child1_vuln[point1:point2] = parent2['vulnerable_assignment'][point1:point2]
+        child2_vuln[point1:point2] = parent1['vulnerable_assignment'][point1:point2]
+
+        # 健全人群分配交叉
+        child1_able = parent1['able_assignment'].copy()
+        child2_able = parent2['able_assignment'].copy()
+        child1_able[point1:point2] = parent2['able_assignment'][point1:point2]
+        child2_able[point1:point2] = parent1['able_assignment'][point1:point2]
+
+        # 构建子代
+        child1 = {
+            'vulnerable_assignment': child1_vuln,
+            'able_assignment': child1_able
+        }
+        child2 = {
+            'vulnerable_assignment': child2_vuln,
+            'able_assignment': child2_able
+        }
+
+        # 修复不可行解
+        child1 = self._repair_individual(child1)
+        child2 = self._repair_individual(child2)
+
+        return child1, child2
+
+    def _mutate(self, individual: Dict) -> Dict:
+        """变异操作"""
+        if random.random() > self.mutation_rate:
+            return self._copy_individual(individual)
+
+        mutated = self._copy_individual(individual)
+
+        # 随机选择变异类型：0=低能人群，1=健全人群
+        mutation_type = random.randint(0, 1)
+
+        if mutation_type == 0 and self.num_primary_gp > 1:
+            # === 变异低能人群分配（只能在一级集合点之间切换）===
+            # 找到有低能人群需求的需求点
+            valid_demands = [i for i in range(self.num_demands) if self.vulnerable_demands[i] > 0]
+
+            if valid_demands:
+                i = random.choice(valid_demands)
+                current_j = mutated['vulnerable_assignment'][i]
+
+                # 找可行的一级集合点
+                feasible = []
+                for j in range(self.num_primary_gp):
+                    if j != current_j and self.primary_distance_matrix[i, j] <= self.dmax:
+                        feasible.append(j)
+
+                if feasible:
+                    mutated['vulnerable_assignment'][i] = random.choice(feasible)
+
+        else:
+            # === 变异健全人群分配（可以切换到一级或二级）===
+            # 找到有健全人群需求的需求点
+            valid_demands = [i for i in range(self.num_demands) if self.able_demands[i] > 0]
+
+            if valid_demands:
+                i = random.choice(valid_demands)
+                current = mutated['able_assignment'][i]
+
+                # 找可行的集合点
+                feasible = []
+
+                # 检查一级集合点
+                for j in range(self.num_primary_gp):
+                    if self.primary_distance_matrix[i, j] <= self.dmax:
+                        option = ('primary', j)
+                        if current != option:
+                            feasible.append(option)
+
+                # 检查二级集合点
+                for j in range(self.num_secondary_gp):
+                    if self.secondary_distance_matrix[i, j] <= self.dmax:
+                        option = ('secondary', j)
+                        if current != option:
+                            feasible.append(option)
+
+                if feasible:
+                    mutated['able_assignment'][i] = random.choice(feasible)
+
+        # 修复可能的不可行解
+        mutated = self._repair_individual(mutated)
+
+        return mutated
+
+    def _repair_individual(self, individual: Dict) -> Dict:
+        """修复不可行个体"""
+        repaired = self._copy_individual(individual)
+
+        # 计算当前负载
+        primary_load = np.zeros(self.num_primary_gp)
+        if self.num_secondary_gp > 0:
+            secondary_load = np.zeros(self.num_secondary_gp)
+        else:
+            secondary_load = np.array([])
+
+        # 统计低能人群负载（只在一级）
+        for i in range(self.num_demands):
+            j = repaired['vulnerable_assignment'][i]
+            if j != -1:
+                primary_load[j] += self.vulnerable_demands[i]
+
+        # 统计健全人群负载
+        for i in range(self.num_demands):
+            assign = repaired['able_assignment'][i]
+            if assign is not None:
+                gp_type, j = assign
+                if gp_type == 'primary':
+                    primary_load[j] += self.able_demands[i]
+                else:
+                    secondary_load[j] += self.able_demands[i]
+
+        # === 修复一级集合点超容量 ===
+        for j in range(self.num_primary_gp):
+            while primary_load[j] > self.primary_capacities[j]:
+                # 优先移动健全人群到二级集合点
+                moved = False
+
+                for i in range(self.num_demands):
+                    assign = repaired['able_assignment'][i]
+                    if assign is not None and assign[0] == 'primary' and assign[1] == j:
+                        able_demand = self.able_demands[i]
+
+                        # 尝试移到二级集合点
+                        for k in range(self.num_secondary_gp):
+                            if (self.secondary_distance_matrix[i, k] <= self.dmax and
+                                    secondary_load[k] + able_demand <= self.secondary_capacities[k]):
+                                repaired['able_assignment'][i] = ('secondary', k)
+                                primary_load[j] -= able_demand
+                                secondary_load[k] += able_demand
+                                moved = True
+                                break
+
+                        if moved:
+                            break
+
+                        # 尝试移到其他一级集合点
+                        for k in range(self.num_primary_gp):
+                            if k != j and (self.primary_distance_matrix[i, k] <= self.dmax and
+                                           primary_load[k] + able_demand <= self.primary_capacities[k]):
+                                repaired['able_assignment'][i] = ('primary', k)
+                                primary_load[j] -= able_demand
+                                primary_load[k] += able_demand
+                                moved = True
+                                break
+
+                        if moved:
+                            break
+
+                if not moved:
+                    # 无法修复，退出循环
+                    break
+
+        # === 修复二级集合点超容量 ===
+        for j in range(self.num_secondary_gp):
+            while secondary_load[j] > self.secondary_capacities[j]:
+                moved = False
+
+                for i in range(self.num_demands):
+                    assign = repaired['able_assignment'][i]
+                    if assign is not None and assign[0] == 'secondary' and assign[1] == j:
+                        able_demand = self.able_demands[i]
+
+                        # 尝试移到一级集合点
+                        for k in range(self.num_primary_gp):
+                            if (self.primary_distance_matrix[i, k] <= self.dmax and
+                                    primary_load[k] + able_demand <= self.primary_capacities[k]):
+                                repaired['able_assignment'][i] = ('primary', k)
+                                secondary_load[j] -= able_demand
+                                primary_load[k] += able_demand
+                                moved = True
+                                break
+
+                        if moved:
+                            break
+
+                        # 尝试移到其他二级集合点
+                        for k in range(self.num_secondary_gp):
+                            if k != j and (self.secondary_distance_matrix[i, k] <= self.dmax and
+                                           secondary_load[k] + able_demand <= self.secondary_capacities[k]):
+                                repaired['able_assignment'][i] = ('secondary', k)
+                                secondary_load[j] -= able_demand
+                                secondary_load[k] += able_demand
+                                moved = True
+                                break
+
+                        if moved:
+                            break
+
+                if not moved:
+                    # 无法修复，退出循环
+                    break
+
+        return repaired
+
+    def _copy_individual(self, individual: Dict) -> Dict:
+        """复制个体"""
+        return {
+            'vulnerable_assignment': individual['vulnerable_assignment'].copy(),
+            'able_assignment': individual['able_assignment'].copy()
+        }
+
+    def _environmental_selection(self, fronts: List[List[int]]):
+        """环境选择"""
+        new_population = []
+
+        for front in fronts:
+            if len(new_population) + len(front) <= self.population_size:
+                # 整个前沿都可以加入
+                new_population.extend(front)
+            else:
+                # 只能加入部分个体
+                remaining_slots = self.population_size - len(new_population)
+                self._calculate_crowding_distance(front)
+
+                # 按拥挤度距离降序排序
+                front.sort(key=lambda x: self.population[x]['crowding_distance'], reverse=True)
+                new_population.extend(front[:remaining_slots])
+                break
+
+        # 更新种群
+        self.population = [self.population[i] for i in new_population]
+
+    def _update_pareto_front(self):
+        """更新帕累托前沿"""
+        # 找到第一层前沿
+        first_front = []
+        for i, individual in enumerate(self.population):
+            if individual['rank'] == 0:
+                first_front.append(individual)
+
+        self.pareto_front = first_front
+
+    def _record_history(self):
+        """记录历史信息"""
+        if self.pareto_front:
+            objectives = [ind['objectives'] for ind in self.pareto_front]
+            obj1_values = [obj[0] for obj in objectives]
+            obj2_values = [obj[1] for obj in objectives]
+
+            self.history['best_obj1'].append(min(obj1_values))
+            self.history['best_obj2'].append(min(obj2_values))
+            self.history['pareto_size'].append(len(self.pareto_front))
+        else:
+            self.history['best_obj1'].append(float('inf'))
+            self.history['best_obj2'].append(float('inf'))
+            self.history['pareto_size'].append(0)
+
+        self.history['generation'].append(self.generation)
+
+    def run(self) -> List[Dict]:
+        """
+        运行遗传算法
+
+        Returns:
+            List[Dict]: 帕累托最优解集
+        """
+        print("\n" + "=" * 60)
+        print("开始运行双目标遗传算法")
+        print("=" * 60)
+
+        start_time = time.time()
+
+        # 初始化种群
+        self._initialize_population()
+
+        for generation in range(self.max_generations):
+            self.generation = generation
+
+            # 非支配排序
+            fronts = self._fast_non_dominated_sort()
+
+            # 计算拥挤度距离
+            for front in fronts:
+                self._calculate_crowding_distance(front)
+
+            # 更新帕累托前沿
+            self._update_pareto_front()
+
+            # 记录历史
+            self._record_history()
+
+            # 输出进度
+            if generation % 20 == 0 or generation == self.max_generations - 1:
+                print(f"第 {generation + 1} 代: 帕累托前沿大小 = {len(self.pareto_front)}")
+                if self.pareto_front:
+                    best_dist = min([ind['objectives'][0] for ind in self.pareto_front])
+                    best_cross = min([ind['objectives'][1] for ind in self.pareto_front])
+                    print(f"  最佳距离: {best_dist:.2f}, 最佳穿越: {best_cross:.2f}")
+
+            # 如果不是最后一代，进行繁殖
+            if generation < self.max_generations - 1:
+                # 繁殖
+                offspring = []
+                while len(offspring) < self.population_size:
+                    # 选择父代
+                    parent1_idx = self._tournament_selection()
+                    parent2_idx = self._tournament_selection()
+
+                    parent1 = {
+                        'vulnerable_assignment': self.population[parent1_idx]['vulnerable_assignment'],
+                        'able_assignment': self.population[parent1_idx]['able_assignment']
+                    }
+                    parent2 = {
+                        'vulnerable_assignment': self.population[parent2_idx]['vulnerable_assignment'],
+                        'able_assignment': self.population[parent2_idx]['able_assignment']
+                    }
+
+                    # 交叉
+                    child1, child2 = self._crossover(parent1, parent2)
+
+                    # 变异
+                    child1 = self._mutate(child1)
+                    child2 = self._mutate(child2)
+
+                    # 计算目标函数
+                    obj1 = self._calculate_objectives(child1)
+                    obj2 = self._calculate_objectives(child2)
+
+                    offspring.extend([
+                        {
+                            'vulnerable_assignment': child1['vulnerable_assignment'],
+                            'able_assignment': child1['able_assignment'],
+                            'objectives': obj1,
+                            'rank': 0,
+                            'crowding_distance': 0.0
+                        },
+                        {
+                            'vulnerable_assignment': child2['vulnerable_assignment'],
+                            'able_assignment': child2['able_assignment'],
+                            'objectives': obj2,
+                            'rank': 0,
+                            'crowding_distance': 0.0
+                        }
+                    ])
+
+                # 合并父代和子代
+                self.population.extend(offspring[:self.population_size])
+
+                # 非支配排序
+                fronts = self._fast_non_dominated_sort()
+
+                # 环境选择
+                self._environmental_selection(fronts)
+
+        end_time = time.time()
+        runtime = end_time - start_time
+        print(f"\nDistance limit: {self.dmax:.1f}m (Terrain type: {self.terrain_type})")
+        print(f"\n算法运行完成，耗时 {runtime:.2f} 秒")
+        print(f"最终帕累托前沿包含 {len(self.pareto_front)} 个解")
+        print(f"\n" + "帕累托最优解详情（共 {len(self.pareto_front)} 个解）")
+        for idx, solution in enumerate(self.pareto_front):
+            assignment = solution['assignment']
+            obj1, obj2 = solution['objectives']
+            # 找出使用的集合点
+            used_gps_indices = sorted(set(assignment[assignment != -1]))
+            used_gps_numbers = [self.gathering_numbers[j] for j in used_gps_indices]
+            print(f"\n【解 {idx + 1}】")
+            print(f"  总距离: {obj1:.0f} 人·米")
+            print(f"  总穿越: {obj2:.0f} 次")
+            print(f"  使用集合点数量: {len(used_gps_indices)}/{self.num_gathering}")
+            print(f"  使用的集合点: {used_gps_numbers}")
+            print(f"  各集合点负载:")
+            for j in sorted(used_gps_indices):
+                gp_num = self.gathering_numbers[j]
+                assigned_to_j = np.where(assignment == j)[0]
+                total_load = np.sum(self.demands[assigned_to_j])
+                capacity = self.capacities[j]
+                utilization = total_load / capacity * 100
+                print(f"    集合点{gp_num}: {total_load:.0f}/{capacity:.0f}人 ({utilization:.1f}%)")
+        print(f"\n" + "=" * 60)
+        return self.pareto_front
+
+    def visualize_results(self, results: Dict):
+        """
+        结果可视化
+
+        Args:
+            results: 优化结果
+        """
+        # 创建图形窗口
+        fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+
+        # 子图1：Pareto前沿
+        ax1 = axes[0, 0]
+        pareto_objectives = [ind['objectives'] for ind in results['pareto_front']]
+        distances = [obj[0] for obj in pareto_objectives]
+        crossings = [obj[1] for obj in pareto_objectives]
+        ax1.scatter(distances, crossings, c='blue', s=50, alpha=0.7)
+        ax1.set_xlabel('加权总步行距离 (m)', fontsize=12)
+        ax1.set_ylabel('加权总穿越次数', fontsize=12)
+        ax1.set_title('Pareto 前沿', fontsize=14)
+        ax1.grid(True, alpha=0.3)
+
+        # 子图2：最佳分配方案可视化
+        ax2 = axes[0, 1]
+        best_solution = results['best_solution']
+        vulnerable_assignment = best_solution['vulnerable_assignment']
+        able_assignment = best_solution['able_assignment']
+
+        # 绘制道路网络
+        pos = nx.get_node_attributes(self.road_network.network, 'pos')
+        nx.draw_networkx(self.road_network.network, pos, ax=ax2,
+                         node_size=20, node_color='lightgray',
+                         edge_color='gray', alpha=0.3, with_labels=False)
+
+        # 绘制需求点
+        demand_x = [pos[n][0] for n in self.demand_nodes]
+        demand_y = [pos[n][1] for n in self.demand_nodes]
+        ax2.scatter(demand_x, demand_y, c='red', s=50, marker='o', label='需求点', zorder=5)
+
+        # 绘制一级集合点
+        primary_x = [pos[n][0] for n in self.primary_gp_nodes]
+        primary_y = [pos[n][1] for n in self.primary_gp_nodes]
+        ax2.scatter(primary_x, primary_y, c='green', s=100, marker='s', label='一级集合点', zorder=5)
+
+        # 绘制二级集合点
+        if self.num_secondary_gp > 0:
+            secondary_x = [pos[n][0] for n in self.secondary_gp_nodes]
+            secondary_y = [pos[n][1] for n in self.secondary_gp_nodes]
+            ax2.scatter(secondary_x, secondary_y, c='orange', s=100, marker='^', label='二级集合点', zorder=5)
+
+        # 绘制低能人群分配连线（红色虚线）
+        for i, demand_node in enumerate(self.demand_nodes):
+            j = vulnerable_assignment[i]
+            if j != -1 and self.vulnerable_demands[i] > 0:
+                gp_node = self.primary_gp_nodes[j]
+                ax2.plot([pos[demand_node][0], pos[gp_node][0]],
+                         [pos[demand_node][1], pos[gp_node][1]],
+                         c='red', alpha=0.6, linewidth=1.5, linestyle = '--')
+
+                # 绘制健全人群分配连线（蓝色实线）
+                for i, demand_node in enumerate(self.demand_nodes):
+                    assign = able_assignment[i]
+                    if assign is not None and self.able_demands[i] > 0:
+                        gp_type, j = assign
+                        if gp_type == 'primary':
+                            gp_node = self.primary_gp_nodes[j]
+                            color = 'blue'
+                        else:
+                            gp_node = self.secondary_gp_nodes[j]
+                            color = 'purple'
+                        ax2.plot([pos[demand_node][0], pos[gp_node][0]],
+                                 [pos[demand_node][1], pos[gp_node][1]],
+                                 c=color, alpha=0.5, linewidth=1)
+
+                ax2.set_title(f'最佳分配方案\n加权距离: {best_solution["objectives"][0]:.1f}m, '
+                              f'加权穿越: {best_solution["objectives"][1]:. 1f}', fontsize=12)
+                ax2.legend(loc='upper right')
+
+                # 添加图例说明
+                legend_elements = [
+                    Line2D([0], [0], color='red', linestyle='--', label='低能人群→一级'),
+                    Line2D([0], [0], color='blue', linestyle='-', label='健全人群→一级'),
+                    Line2D([0], [0], color='purple', linestyle='-', label='健全人群→二级')
+                ]
+                ax2.legend(handles=legend_elements, loc='lower right')
+
+                # 子图3：收敛曲线 - 距离
+                ax3 = axes[1, 0]
+                ax3.plot(results['history']['generations'],
+                         results['history']['avg_distance'], 'b-', linewidth=2)
+                ax3.set_xlabel('迭代次数', fontsize=12)
+                ax3.set_ylabel('平均加权距离 (m)', fontsize=12)
+                ax3.set_title('收敛曲线 - 步行距离', fontsize=14)
+                ax3.grid(True, alpha=0.3)
+
+                # 子图4：收敛曲线 - 穿越次数
+                ax4 = axes[1, 1]
+                ax4.plot(results['history']['generations'],
+                         results['history']['avg_crossings'], 'r-', linewidth=2)
+                ax4.set_xlabel('迭代次数', fontsize=12)
+                ax4.set_ylabel('平均加权穿越次数', fontsize=12)
+                ax4.set_title('收敛曲线 - 穿越次数', fontsize=14)
+                ax4.grid(True, alpha=0.3)
+
+                plt.tight_layout()
+                plt.savefig('nsga2_results.png', dpi=150, bbox_inches='tight')
+                plt.show()
+
+                print(f"\n优化结果已保存为 'nsga2_results.png'")
+
+    def export_results(self, filename: str = "pareto_solutions.csv"):
+        """导出帕累托最优解到CSV文件"""
+        if not self.pareto_front:
+            print("没有找到可行解")
+            return
+
+        results = []
+        for idx, solution in enumerate(self.pareto_front):
+            vulnerable_assignment = solution['vulnerable_assignment']
+            able_assignment = solution['able_assignment']
+            obj1, obj2 = solution['objectives']
+
+            # 计算低能人群分配统计
+            vulnerable_allocated = np.sum(vulnerable_assignment != -1)
+            total_vulnerable_demand = np.sum(self.vulnerable_demands[vulnerable_assignment != -1])
+
+            # 计算健全人群分配统计
+            able_allocated = 0
+            total_able_demand = 0
+            for i in range(self.num_demands):
+                if able_assignment[i] is not None:
+                    able_allocated += 1
+                    total_able_demand += self.able_demands[i]
+
+            # 计算一级集合点利用率
+            primary_utilization = []
+            for j in range(self.num_primary_gp):
+                # 低能人群负载
+                vuln_load = np.sum(self.vulnerable_demands[vulnerable_assignment == j])
+                # 健全人群负载
+                able_load = 0
+                for i in range(self.num_demands):
+                    assign = able_assignment[i]
+                    if assign is not None and assign[0] == 'primary' and assign[1] == j:
+                        able_load += self.able_demands[i]
+                total_load = vuln_load + able_load
+                util_rate = total_load / self.primary_capacities[j] if self.primary_capacities[j] > 0 else 0
+                primary_utilization.append(util_rate)
+
+            # 计算二级集合点利用率
+            secondary_utilization = []
+            for j in range(self.num_secondary_gp):
+                able_load = 0
+                for i in range(self.num_demands):
+                    assign = able_assignment[i]
+                    if assign is not None and assign[0] == 'secondary' and assign[1] == j:
+                        able_load += self.able_demands[i]
+                util_rate = able_load / self.secondary_capacities[j] if self.secondary_capacities[j] > 0 else 0
+                secondary_utilization.append(util_rate)
+
+            avg_primary_util = np.mean(primary_utilization) if primary_utilization else 0
+            avg_secondary_util = np.mean(secondary_utilization) if secondary_utilization else 0
+
+            # 将 able_assignment 转换为可序列化格式
+            able_assignment_serialized = []
+            for assign in able_assignment:
+                if assign is None:
+                    able_assignment_serialized.append(None)
+                else:
+                    able_assignment_serialized.append(f"{assign[0]}_{assign[1]}")
+
+            results.append({
+                'solution_id': idx + 1,
+                'weighted_total_distance': obj1,
+                'weighted_total_crossings': obj2,
+                'vulnerable_allocated': vulnerable_allocated,
+                'able_allocated': able_allocated,
+                'total_vulnerable_demand': total_vulnerable_demand,
+                'total_able_demand': total_able_demand,
+                'avg_primary_utilization': avg_primary_util,
+                'avg_secondary_utilization': avg_secondary_util,
+                'vulnerable_assignment': vulnerable_assignment.tolist(),
+                'able_assignment': able_assignment_serialized
+            })
+
+        df = pd.DataFrame(results)
+        df.to_csv(filename, index=False, encoding='utf-8-sig')
+        print(f"帕累托最优解已导出到 {filename}")
+
+
+def run_optimization(road_network_selector,
+                     terrain_type='flat',  # 在这里调整地形类别：flat/hilly/mountainous
+                     elevation_factor=1.0,  # 在这里微调地形参数
+                     road_condition_factor=1.0,  # 在这里微调道路参数
+                     vulnerable_weight=2.0,  # 低能人群权重（默认2.0，表示低能人群的距离和穿越成本是健全人群的2倍）
+                     population_size=100,  # 种群大小
+                     max_generations=200):  # 最大迭代次数
+    """
+    运行优化算法的主函数
+
+    Args:
+        road_network_selector: RoadNetworkSelector实例
+        terrain_type: 地形类型 ('flat'=平原, 'hilly'=丘陵, 'mountainous'=山区)
+        elevation_factor: 海拔影响因子 (0. 5-2.0, 值越小距离限制越严格)
+        road_condition_factor: 路况影响因子 (0.5-2.0, 值越小距离限制越严格)
+        vulnerable_weight: 低能人群权重 (>=1.0, 值越大越优先考虑低能人群)
+        population_size: 种群大小
+        max_generations: 最大迭代次数
+    """
+    try:
+        # 创建遗传算法实例
+        ga = MultiObjectiveGA(
+            road_network=road_network_selector,
+            population_size=population_size,
+            max_generations=max_generations,
+            crossover_rate=0.8,
+            mutation_rate=0.1,
+            terrain_type=terrain_type,
+            elevation_factor=elevation_factor,
+            road_condition_factor=road_condition_factor,
+            vulnerable_weight=vulnerable_weight
+        )
+
+        # 运行算法
+        pareto_solutions = ga.run()
+
+        # 可视化结果
+        ga.visualize_results()
+
+        # 导出结果
+        ga.export_results()
+
+        return ga, pareto_solutions
+
+    except Exception as e:
+        print(f"优化过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+if __name__ == "__main__":
+    print("双目标遗传算法模块")
+    print("请从主程序调用 run_optimization() 函数")
