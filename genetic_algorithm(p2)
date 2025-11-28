@@ -1,4 +1,4 @@
-        def _repair_individual(self, individual: Dict) -> Dict:
+    def _repair_individual(self, individual: Dict) -> Dict:
         """修复不可行个体"""
         repaired = self._copy_individual(individual)
 
