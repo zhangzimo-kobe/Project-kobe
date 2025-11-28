@@ -1,12 +1,12 @@
 import numpy as np
 import networkx as nx
-import matplotlib. pyplot as plt
+import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import random
 from typing import List, Tuple, Dict
 import time
 import pandas as pd
-
+import copy
 
 class MultiObjectiveGA:
     def __init__(self, road_network,
@@ -116,7 +116,7 @@ class MultiObjectiveGA:
                     if not np.isinf(distance) and distance <= self.dmax:
                         self.primary_distance_matrix[i, j] = distance
 
-        print(f"一级距离矩阵构建完成，距离限制: {self.dmax:. 1f}m")
+        print(f"一级距离矩阵构建完成，距离限制: {self.dmax:.1f}m")
 
         # 提取二级集合点距离矩阵
         if self.num_secondary_gp > 0 and self.road_network.secondary_distance_matrix is not None:
@@ -161,7 +161,7 @@ class MultiObjectiveGA:
         terrain_base_distances = {
             'flat': 1500,  # 平原：1500米
             'hilly': 1200,  # 丘陵：1200米
-        '   mountainous': 900  # 山区：900米
+            'mountainous': 900  # 山区：900米
         }
 
         # 获取地形基础距离
@@ -518,3 +518,102 @@ class MultiObjectiveGA:
                 best = i
 
         return best
+
+    def _crossover(self, parent1: Dict, parent2: Dict) -> Tuple[Dict, Dict]:
+        """二点交叉操作"""
+        if random.random() > self.crossover_rate:
+            return self._copy_individual(parent1), self._copy_individual(parent2)
+
+        # 二点交叉
+        point1 = random.randint(1, self.num_demands - 2)
+        point2 = random.randint(point1 + 1, self.num_demands - 1)
+
+        # 低能人群分配交叉
+        child1_vuln = parent1['vulnerable_assignment'].copy()
+        child2_vuln = parent2['vulnerable_assignment'].copy()
+        child1_vuln[point1:point2] = parent2['vulnerable_assignment'][point1:point2]
+        child2_vuln[point1:point2] = parent1['vulnerable_assignment'][point1:point2]
+
+        # ✅ 健全人群分配交叉 - 使用深拷贝
+        child1_able = copy.deepcopy(parent1['able_assignment'])
+        child2_able = copy.deepcopy(parent2['able_assignment'])
+        child1_able[point1:point2] = copy.deepcopy(parent2['able_assignment'][point1:point2])
+        child2_able[point1:point2] = copy.deepcopy(parent1['able_assignment'][point1:point2])
+
+        # 构建子代
+        child1 = {
+            'vulnerable_assignment': child1_vuln,
+            'able_assignment': child1_able
+        }
+        child2 = {
+            'vulnerable_assignment': child2_vuln,
+            'able_assignment': child2_able
+        }
+
+        # 修复不可行解
+        child1 = self._repair_individual(child1)
+        child2 = self._repair_individual(child2)
+
+        return child1, child2
+
+    def _mutate(self, individual: Dict) -> Dict:
+        """变异操作"""
+        if random.random() > self.mutation_rate:
+            return self._copy_individual(individual)
+
+        mutated = self._copy_individual(individual)
+
+        # 随机选择变异类型：0=低能人群，1=健全人群
+        mutation_type = random.randint(0, 1)
+
+        if mutation_type == 0 and self.num_primary_gp > 1:
+            # === 变异低能人群分配（只能在一级集合点之间切换）===
+            # 找到有低能人群需求的需求点
+            valid_demands = [i for i in range(self.num_demands) if self.vulnerable_demands[i] > 0]
+
+            if valid_demands:
+                i = random.choice(valid_demands)
+                current_j = mutated['vulnerable_assignment'][i]
+
+                # 找可行的一级集合点
+                feasible = []
+                for j in range(self.num_primary_gp):
+                    if j != current_j and self.primary_distance_matrix[i, j] <= self.dmax:
+                        feasible.append(j)
+
+                if feasible:
+                    mutated['vulnerable_assignment'][i] = random.choice(feasible)
+
+        else:
+            # === 变异健全人群分配（可以切换到一级或二级）===
+            # 找到有健全人群需求的需求点
+            valid_demands = [i for i in range(self.num_demands) if self.able_demands[i] > 0]
+
+            if valid_demands:
+                i = random.choice(valid_demands)
+                current = mutated['able_assignment'][i]
+
+                # 找可行的集合点
+                feasible = []
+
+                # 检查一级集合点
+                for j in range(self.num_primary_gp):
+                    if self.primary_distance_matrix[i, j] <= self.dmax:
+                        option = ('primary', j)
+                        if current != option:
+                            feasible.append(option)
+
+                # 检查二级集合点
+                for j in range(self.num_secondary_gp):
+                    if self.secondary_distance_matrix[i, j] <= self.dmax:
+                        option = ('secondary', j)
+                        if current != option:
+                            feasible.append(option)
+
+                if feasible:
+                    mutated['able_assignment'][i] = random.choice(feasible)
+
+        # 修复可能的不可行解
+        mutated = self._repair_individual(mutated)
+
+        return mutated
