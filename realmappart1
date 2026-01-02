@@ -1,3 +1,4 @@
+import os
 import osmnx as ox
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -20,6 +21,10 @@ class RoadNetworkSelector:
         self.G = ox.project_graph(self.G)
         self.nodes, self.edges = ox.graph_to_gdfs(self.G)
         self.original_G = self.G.copy()
+        self.shelter_path = "data/Shelter.geojson"
+        self.shelter_gdf = None
+        self.shelter_visible = False  # 默认先不显示（和灾害按钮一致的体验）
+        self.load_shelter_data()
         self.selected_G = nx.MultiDiGraph()
         for key, value in self.original_G.graph.items():
             self.selected_G.graph[key] = value
@@ -62,6 +67,56 @@ class RoadNetworkSelector:
         self.draw_map(preserve_view=False)
         self.connect_events()
         plt.show()
+
+    def load_shelter_data(self):
+        """从 data/Shelter.geojson 加载避难所点数据，并投影到路网坐标系"""
+        try:
+            if not os.path.exists(self.shelter_path):
+                print(f"提示：未找到避难所文件 {self.shelter_path}，将不显示避难所点")
+                self.shelter_gdf = None
+                return
+
+            gdf = gpd.read_file(self.shelter_path)
+            if gdf is None or len(gdf) == 0:
+                print(f"提示：避难所文件 {self.shelter_path} 为空，无法显示")
+                self.shelter_gdf = None
+                return
+
+            if not gdf.crs:
+                print("警告：Shelter.geojson 没有 CRS 信息，假定为 EPSG:4326")
+                gdf = gdf.set_crs("EPSG:4326", allow_override=True)
+
+            if gdf.crs != self.nodes.crs:
+                gdf = gdf.to_crs(self.nodes.crs)
+
+            self.shelter_gdf = gdf
+            print(f"✓ 成功加载避难所数据: {self.shelter_path}（{len(gdf)} 个点）")
+
+        except Exception as e:
+            print(f"✗ 加载避难所数据失败: {e}")
+            self.shelter_gdf = None
+
+    def draw_shelters(self):
+        """在地图上绘制避难所点"""
+        if not self.shelter_visible:
+            return
+        if self.shelter_gdf is None:
+            return
+
+        self.shelter_gdf.plot(
+            ax=self.ax,
+            color="magenta",
+            markersize=35,
+            alpha=0.9,
+            zorder=11
+        )
+
+    def toggle_shelter(self, event):
+        """切换避难所点显示"""
+        self.shelter_visible = not self.shelter_visible
+        status = "显示" if self.shelter_visible else "隐藏"
+        print(f"避难所图层: {status}")
+        self.draw_map()
 
     def load_disaster_data(self):
         """从data/目录加载灾害文件（支持GeoJSON和Shapefile）"""
@@ -268,7 +323,13 @@ class RoadNetworkSelector:
         self.btn_flood = Button(ax_flood, 'Flood')
         self.btn_flood.on_clicked(self.toggle_flood)
 
-    def draw_map(self, preserve_view=True):
+        ax_shelter = plt.axes(
+            [disaster_start_x + 0.30, disaster_y_position, disaster_button_width, disaster_button_height]
+        )
+        self.btn_shelter = Button(ax_shelter, 'Shelter')
+        self.btn_shelter.on_clicked(self.toggle_shelter)
+
+        def draw_map(self, preserve_view=True):
         if preserve_view:
             try:
                 xlim = self.ax.get_xlim()
@@ -305,6 +366,7 @@ class RoadNetworkSelector:
 
         self.nodes.plot(ax=self.ax, color=node_colors, markersize=node_sizes, alpha=0.8)
         self.draw_disaster_layers()
+        self.draw_shelters()
         plt.suptitle(self.location_name, fontsize=16, y=0.98)
         # 模式提示标语
         if self.mode == 'nodes':
