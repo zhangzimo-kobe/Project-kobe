@@ -88,7 +88,11 @@ class RoadNetworkSelector:
 
             if gdf.crs != self.nodes.crs:
                 gdf = gdf.to_crs(self.nodes.crs)
-
+                xs = gdf.geometry.x.to_numpy()
+                ys = gdf.geometry.y.to_numpy()
+                gdf["nearest_node"] = ox.distance.nearest_nodes(self.original_G, xs, ys)
+                self._shelter_xy = np.column_stack([xs, ys])
+                self.shelter_gdf = gdf
             self.shelter_gdf = gdf
             print(f"✓ 成功加载避难所数据: {self.shelter_path}（{len(gdf)} 个点）")
 
@@ -96,20 +100,18 @@ class RoadNetworkSelector:
             print(f"✗ 加载避难所数据失败: {e}")
             self.shelter_gdf = None
 
-    def draw_shelters(self):
-        """在地图上绘制避难所点"""
-        if not self.shelter_visible:
-            return
-        if self.shelter_gdf is None:
-            return
+    def _find_nearest_shelter(self, x, y, threshold=80):
+        if self.shelter_gdf is None or len(self.shelter_gdf) == 0:
+            return None
+        if not hasattr(self, "_shelter_xy"):
+            return None
 
-        self.shelter_gdf.plot(
-            ax=self.ax,
-            color="magenta",
-            markersize=35,
-            alpha=0.9,
-            zorder=11
-        )
+        click = np.array([x, y])
+        dists = np.linalg.norm(self._shelter_xy - click, axis=1)
+        idx = int(np.argmin(dists))
+        if dists[idx] > threshold:
+            return None
+        return self.shelter_gdf.iloc[idx]
 
     def toggle_shelter(self, event):
         """切换避难所点显示"""
@@ -510,6 +512,7 @@ class RoadNetworkSelector:
         else:
             self.mode = 'primary_gathering'
             self.btn_primary_gp.label.set_text('Switch to Road')
+            self.shelter_visible = True
         self.temp_edge = []
         self.draw_map()
 
@@ -521,6 +524,7 @@ class RoadNetworkSelector:
         else:
             self.mode = 'secondary_gathering'
             self.btn_secondary_gp.label.set_text('Switch to Road')
+            self.shelter_visible = True
         self.temp_edge = []
         self.draw_map()
 
@@ -597,96 +601,74 @@ class RoadNetworkSelector:
             self.draw_map()
 
     def select_primary_gathering_point(self, event):
-        """选择一级集合点"""
         self.save_history()
         x, y = event.xdata, event.ydata
-        click_point = Point(x, y)
-        min_dist = float('inf')
-        nearest_node = None
 
-        for node_id, node_data in self.nodes.iterrows():
-            node_geom = node_data.geometry
-            dist = node_geom.distance(click_point)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_node = node_id
+        shelter = self._find_nearest_shelter(x, y, threshold=80)
+        if shelter is None:
+            print("提示：请点击避难所点（Primary GP 模式下不允许直接点任意节点）")
+            return
 
-        if nearest_node is not None and min_dist < 100:
-            if nearest_node in self.primary_gathering_points:
-                # 取消选择
-                self.primary_gathering_points.remove(nearest_node)
-                if nearest_node in self.primary_capacities:
-                    del self.primary_capacities[nearest_node]
-                print(f"取消选择一级集合点: {nearest_node}")
-            else:
-                # 检查是否已是二级集合点
-                if nearest_node in self.secondary_gathering_points:
-                    print(f"错误：节点 {nearest_node} 已是二级集合点，不能同时是两种集合点")
-                    return
+        nearest_node = int(shelter["nearest_node"])
 
-                # 添加为一级集合点
-                self.primary_gathering_points.add(nearest_node)
-                if nearest_node not in self.selected_nodes:
-                    self.selected_nodes.add(nearest_node)
+        if nearest_node in self.primary_gathering_points:
+            self.primary_gathering_points.remove(nearest_node)
+            self.primary_capacities.pop(nearest_node, None)
+            print(f"取消选择一级集合点(避难所映射节点): {nearest_node}")
+        else:
+            if nearest_node in self.secondary_gathering_points:
+                print(f"错误：节点 {nearest_node} 已是二级集合点，不能同时是两种集合点")
+                return
 
-                try:
-                    capacity_str = input(f"请输入一级集合点 {nearest_node} 的容量: ")
-                    capacity = int(capacity_str)
-                    if capacity > 0:
-                        self.primary_capacities[nearest_node] = capacity
-                        print(f"一级集合点已选择: {nearest_node}, 容量: {capacity}")
-                    else:
-                        print("错误：容量必须为正整数")
-                except Exception as e:
-                    print(f"输入错误: {e}")
+            self.primary_gathering_points.add(nearest_node)
+            self.selected_nodes.add(nearest_node)
 
-            self.draw_map()
+            try:
+                capacity = int(input(f"请输入一级集合点 {nearest_node} 的容量: "))
+                if capacity > 0:
+                    self.primary_capacities[nearest_node] = capacity
+                    print(f"一级集合点已选择: {nearest_node}, 容量: {capacity}")
+                else:
+                    print("错误：容量必须为正整数")
+            except Exception as e:
+                print(f"输入错误: {e}")
+
+        self.draw_map()
 
     def select_secondary_gathering_point(self, event):
-        """选择二级集合点"""
         self.save_history()
         x, y = event.xdata, event.ydata
-        click_point = Point(x, y)
-        min_dist = float('inf')
-        nearest_node = None
 
-        for node_id, node_data in self.nodes.iterrows():
-            node_geom = node_data.geometry
-            dist = node_geom.distance(click_point)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_node = node_id
+        shelter = self._find_nearest_shelter(x, y, threshold=80)
+        if shelter is None:
+            print("提示：请点击避难所点（Secondary GP 模式下不允许直接点任意节点）")
+            return
 
-        if nearest_node is not None and min_dist < 100:
-            if nearest_node in self.secondary_gathering_points:
-                # 取消选择
-                self.secondary_gathering_points.remove(nearest_node)
-                if nearest_node in self.secondary_capacities:
-                    del self.secondary_capacities[nearest_node]
-                print(f"取消选择二级集合点: {nearest_node}")
-            else:
-                # 检查是否已是一级集合点
-                if nearest_node in self.primary_gathering_points:
-                    print(f"错误：节点 {nearest_node} 已是一级集合点，不能同时是两种集合点")
-                    return
+        nearest_node = int(shelter["nearest_node"])
 
-                # 添加为二级集合点
-                self.secondary_gathering_points.add(nearest_node)
-                if nearest_node not in self.selected_nodes:
-                    self.selected_nodes.add(nearest_node)
+        if nearest_node in self.secondary_gathering_points:
+            self.secondary_gathering_points.remove(nearest_node)
+            self.secondary_capacities.pop(nearest_node, None)
+            print(f"取消选择二级集合点(避难所映射节点): {nearest_node}")
+        else:
+            if nearest_node in self.primary_gathering_points:
+                print(f"错误：节点 {nearest_node} 已是一级集合点，不能同时是两种集合点")
+                return
 
-                try:
-                    capacity_str = input(f"请输入二级集合点 {nearest_node} 的容量: ")
-                    capacity = int(capacity_str)
-                    if capacity > 0:
-                        self.secondary_capacities[nearest_node] = capacity
-                        print(f"二级集合点已选择: {nearest_node}, 容量: {capacity}")
-                    else:
-                        print("错误：容量必须为正整数")
-                except Exception as e:
-                    print(f"输入错误: {e}")
+            self.secondary_gathering_points.add(nearest_node)
+            self.selected_nodes.add(nearest_node)
 
-            self.draw_map()
+            try:
+                capacity = int(input(f"请输入二级集合点 {nearest_node} 的容量: "))
+                if capacity > 0:
+                    self.secondary_capacities[nearest_node] = capacity
+                    print(f"二级集合点已选择: {nearest_node}, 容量: {capacity}")
+                else:
+                    print("错误：容量必须为正整数")
+            except Exception as e:
+                print(f"输入错误: {e}")
+
+        self.draw_map()
 
     def select_edge(self, event):
         self.save_history()
