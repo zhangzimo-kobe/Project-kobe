@@ -1,47 +1,165 @@
-    def _repair_individual(self, individual: Dict) -> Dict:
-        """修复不可行个体"""
+        def _repair_individual(self, individual: Dict) -> Dict:
+        """
+        修复不可行个体（重点修复容量约束；距离约束在生成/变异时已筛过）
+        修复策略：
+          1) 一级超载：优先移动健全人群（P1->P2 或 P1->其他P1）
+          2) 若一级仍超载：再移动低能人群（只能 P1->其他P1）
+          3) 二级超载：移动健全人群（P2->P1 或 P2->其他P2）
+        """
         repaired = self._copy_individual(individual)
 
-        # 计算当前负载
-        primary_load = np.zeros(self.num_primary_gp)
-        if self.num_secondary_gp > 0:
-            secondary_load = np.zeros(self.num_secondary_gp)
-        else:
-            secondary_load = np.array([])
+        # ---------- 计算当前负载 ----------
+        primary_load = np.zeros(self.num_primary_gp, dtype=float)
+        secondary_load = np.zeros(self.num_secondary_gp, dtype=float) if self.num_secondary_gp > 0 else np.array([])
 
-        # 统计低能人群负载（只在一级）
+        # 低能负载（只在一级）
         for i in range(self.num_demands):
             j = repaired['vulnerable_assignment'][i]
-            if j != -1:
+            if j != -1 and self.vulnerable_demands[i] > 0:
                 primary_load[j] += self.vulnerable_demands[i]
 
-        # 统计健全人群负载
+        # 健全负载
         for i in range(self.num_demands):
             assign = repaired['able_assignment'][i]
-            if assign is not None:
-                gp_type, j = assign
-                if gp_type == 'primary':
-                    primary_load[j] += self.able_demands[i]
-                else:
+            if assign is None or self.able_demands[i] <= 0:
+                continue
+            gp_type, j = assign
+            if gp_type == 'primary':
+                primary_load[j] += self.able_demands[i]
+            else:
+                if self.num_secondary_gp > 0:
                     secondary_load[j] += self.able_demands[i]
 
-        # === 修复一级集合点超容量 ===
+        # 为避免死循环：每个集合点最多尝试移动若干次
+        max_moves_per_gp = self.num_demands * 2
+
+        # ---------- 工具函数：检查某个需求点 i 能否把健全人群移到指定点 ----------
+        def can_move_able_to_primary(i: int, k: int) -> bool:
+            return (self.primary_distance_matrix[i, k] <= self.dmax_able and
+                    primary_load[k] + self.able_demands[i] <= self.primary_capacities[k])
+
+        def can_move_able_to_secondary(i: int, k: int) -> bool:
+            if self.num_secondary_gp <= 0:
+                return False
+            return (self.secondary_distance_matrix[i, k] <= self.dmax_able and
+                    secondary_load[k] + self.able_demands[i] <= self.secondary_capacities[k])
+
+        # ---------- 工具函数：检查某个需求点 i 能否把低能人群移到指定一级点 ----------
+        def can_move_vuln_to_primary(i: int, k: int) -> bool:
+            return (self.primary_distance_matrix[i, k] <= self.dmax_able and
+                    primary_load[k] + self.vulnerable_demands[i] <= self.primary_capacities[k])
+
+        # 1) 修复一级集合点超容量
         for j in range(self.num_primary_gp):
-            while primary_load[j] > self.primary_capacities[j]:
-                # 优先移动健全人群到二级集合点
+            moves = 0
+            while primary_load[j] > self.primary_capacities[j] and moves < max_moves_per_gp:
                 moved = False
 
+                # (1) 优先移动“健全人群（当前在该一级点）”
                 for i in range(self.num_demands):
                     assign = repaired['able_assignment'][i]
-                    if assign is not None and assign[0] == 'primary' and assign[1] == j:
-                        able_demand = self.able_demands[i]
+                    if (assign is None) or (self.able_demands[i] <= 0):
+                        continue
+                    if assign[0] != 'primary' or assign[1] != j:
+                        continue
 
-                        # 尝试移到二级集合点
+                    able_demand = self.able_demands[i]
+
+                    # 1.1 尝试 P1(j) -> P2(k)
+                    if self.num_secondary_gp > 0:
                         for k in range(self.num_secondary_gp):
-                            if (self.secondary_distance_matrix[i, k] <= self.dmax and
-                                    secondary_load[k] + able_demand <= self.secondary_capacities[k]):
+                            if can_move_able_to_secondary(i, k):
                                 repaired['able_assignment'][i] = ('secondary', k)
                                 primary_load[j] -= able_demand
+                                secondary_load[k] += able_demand
+                                moved = True
+                                break
+                        if moved:
+                            break
+
+                    # 1.2 尝试 P1(j) -> P1(k)
+                    for k in range(self.num_primary_gp):
+                        if k == j:
+                            continue
+                        if can_move_able_to_primary(i, k):
+                            repaired['able_assignment'][i] = ('primary', k)
+                            primary_load[j] -= able_demand
+                            primary_load[k] += able_demand
+                            moved = True
+                            break
+
+                    if moved:
+                        break
+
+                if moved:
+                    moves += 1
+                    continue
+
+                # 若健全人群无法再移动，尝试移动“低能人群（当前在该一级点）”
+                for i in range(self.num_demands):
+                    cur_j = repaired['vulnerable_assignment'][i]
+                    if cur_j != j or self.vulnerable_demands[i] <= 0:
+                        continue
+
+                    vuln_demand = self.vulnerable_demands[i]
+
+                    # 尝试 P1(j) -> P1(k)
+                    feasible_targets = []
+                    for k in range(self.num_primary_gp):
+                        if k == j:
+                            continue
+                        if can_move_vuln_to_primary(i, k):
+                            feasible_targets.append(k)
+
+                    if feasible_targets:
+                        # 这里可随机，也可选最近。给你选最近更稳：
+                        best_k = min(feasible_targets, key=lambda k: self.primary_distance_matrix[i, k])
+                        repaired['vulnerable_assignment'][i] = best_k
+                        primary_load[j] -= vuln_demand
+                        primary_load[best_k] += vuln_demand
+                        moved = True
+                        break
+
+                if not moved:
+                    # 实在修不动（可能整体不可行或距离限制太严）
+                    break
+
+                moves += 1
+
+        # 2) 修复二级集合点超容量
+        if self.num_secondary_gp > 0:
+            for j in range(self.num_secondary_gp):
+                moves = 0
+                while secondary_load[j] > self.secondary_capacities[j] and moves < max_moves_per_gp:
+                    moved = False
+
+                    for i in range(self.num_demands):
+                        assign = repaired['able_assignment'][i]
+                        if (assign is None) or (self.able_demands[i] <= 0):
+                            continue
+                        if assign[0] != 'secondary' or assign[1] != j:
+                            continue
+
+                        able_demand = self.able_demands[i]
+
+                        # 2.1 尝试 P2(j) -> P1(k)
+                        for k in range(self.num_primary_gp):
+                            if can_move_able_to_primary(i, k):
+                                repaired['able_assignment'][i] = ('primary', k)
+                                secondary_load[j] -= able_demand
+                                primary_load[k] += able_demand
+                                moved = True
+                                break
+                        if moved:
+                            break
+
+                        # 2.2 尝试 P2(j) -> P2(k)
+                        for k in range(self.num_secondary_gp):
+                            if k == j:
+                                continue
+                            if can_move_able_to_secondary(i, k):
+                                repaired['able_assignment'][i] = ('secondary', k)
+                                secondary_load[j] -= able_demand
                                 secondary_load[k] += able_demand
                                 moved = True
                                 break
@@ -49,70 +167,25 @@
                         if moved:
                             break
 
-                        # 尝试移到其他一级集合点
-                        for k in range(self.num_primary_gp):
-                            if k != j and (self.primary_distance_matrix[i, k] <= self.dmax and
-                                           primary_load[k] + able_demand <= self.primary_capacities[k]):
-                                repaired['able_assignment'][i] = ('primary', k)
-                                primary_load[j] -= able_demand
-                                primary_load[k] += able_demand
-                                moved = True
-                                break
+                    if not moved:
+                        break
 
-                        if moved:
-                            break
+                    moves += 1
 
-                if not moved:
-                    # 无法修复，退出循环
-                    break
-
-        # === 修复二级集合点超容量 ===
-        for j in range(self.num_secondary_gp):
-            while secondary_load[j] > self.secondary_capacities[j]:
-                moved = False
-
-                for i in range(self.num_demands):
-                    assign = repaired['able_assignment'][i]
-                    if assign is not None and assign[0] == 'secondary' and assign[1] == j:
-                        able_demand = self.able_demands[i]
-
-                        # 尝试移到一级集合点
-                        for k in range(self.num_primary_gp):
-                            if (self.primary_distance_matrix[i, k] <= self.dmax and
-                                    primary_load[k] + able_demand <= self.primary_capacities[k]):
-                                repaired['able_assignment'][i] = ('primary', k)
-                                secondary_load[j] -= able_demand
-                                primary_load[k] += able_demand
-                                moved = True
-                                break
-
-                        if moved:
-                            break
-
-                        # 尝试移到其他二级集合点
-                        for k in range(self.num_secondary_gp):
-                            if k != j and (self.secondary_distance_matrix[i, k] <= self.dmax and
-                                           secondary_load[k] + able_demand <= self.secondary_capacities[k]):
-                                repaired['able_assignment'][i] = ('secondary', k)
-                                secondary_load[j] -= able_demand
-                                secondary_load[k] += able_demand
-                                moved = True
-                                break
-
-                        if moved:
-                            break
-
-                if not moved:
-                    # 无法修复，退出循环
-                    break
+        # 这里用你已有的可行性检查函数（如果你希望更严格，可以改成不可行就抛错/重生成）
+        if hasattr(self, "_is_feasible_assignment"):
+            if not self._is_feasible_assignment(repaired):
+                # 保守策略：直接返回（让后续选择淘汰它）
+                # 更激进策略：raise ValueError 或者 return self._generate_random_individual()
+                return repaired
 
         return repaired
 
     def _copy_individual(self, individual: Dict) -> Dict:
-        """复制个体"""
+        """复制个体（深拷贝版，避免引用共享）"""
         return {
             'vulnerable_assignment': individual['vulnerable_assignment'].copy(),
-            'able_assignment': individual['able_assignment'].copy()
+            'able_assignment': copy.deepcopy(individual['able_assignment'])
         }
 
     def _environmental_selection(self, fronts: List[List[int]]):
@@ -260,7 +333,8 @@
 
         end_time = time.time()
         runtime = end_time - start_time
-        print(f"\nDistance limit: {self.dmax:.1f}m (Terrain type: {self.terrain_type})")
+        print(f"\nDistance limit base: {self.dmax_base:.1f}m (Terrain type: {self.terrain_type})")
+        print(f"Distance limit vulnerable/able: {self.dmax_vulnerable:.1f}m / {self.dmax_able:.1f}m")
         print(f"\n算法运行完成，耗时 {runtime:.2f} 秒")
         print(f"最终帕累托前沿包含 {len(self.pareto_front)} 个解")
         print(f"\n帕累托最优解详情（共 {len(self.pareto_front)} 个解）")
