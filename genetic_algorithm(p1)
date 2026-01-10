@@ -17,7 +17,9 @@ class MultiObjectiveGA:
                  terrain_type: str = 'flat',
                  elevation_factor: float = 1.0,
                  road_condition_factor: float = 1.0,
-                 vulnerable_weight: float = 1.5
+                 vulnerable_weight: float = 1.5,
+                 alpha_vulnerable: float = 0.6,  # 低能人群距离系数
+                 alpha_able: float = 1.0  # 健全人群距离系数
                  ):
         self.road_network = road_network
         self.population_size = population_size
@@ -28,9 +30,11 @@ class MultiObjectiveGA:
         self.elevation_factor = elevation_factor
         self.road_condition_factor = road_condition_factor
         self.vulnerable_weight = vulnerable_weight  # 低能人群权重
-        self.dmax = self._calculate_terrain_based_dmax()
-
-        # 提取问题数据
+        self.alpha_vulnerable = alpha_vulnerable
+        self.alpha_able = alpha_able
+        self.dmax_base = self._calculate_terrain_based_dmax()
+        self.dmax_vulnerable = self.dmax_base * self.alpha_vulnerable
+        self.dmax_able = self.dmax_base * self.alpha_able
         self._extract_problem_data()
 
         # 算法状态
@@ -113,10 +117,8 @@ class MultiObjectiveGA:
             for j, gp_node in enumerate(self.primary_gp_nodes):
                 if demand_node in primary_df.index and gp_node in primary_df.columns:
                     distance = primary_df.loc[demand_node, gp_node]
-                    if not np.isinf(distance) and distance <= self.dmax:
+                    if not np.isinf(distance):
                         self.primary_distance_matrix[i, j] = distance
-
-        print(f"一级距离矩阵构建完成，距离限制: {self.dmax:.1f}m")
 
         # 提取二级集合点距离矩阵
         if self.num_secondary_gp > 0 and self.road_network.secondary_distance_matrix is not None:
@@ -126,9 +128,8 @@ class MultiObjectiveGA:
                 for j, gp_node in enumerate(self.secondary_gp_nodes):
                     if demand_node in secondary_df.index and gp_node in secondary_df.columns:
                         distance = secondary_df.loc[demand_node, gp_node]
-                        if not np.isinf(distance) and distance <= self.dmax:
+                        if not np.isinf(distance):
                             self.secondary_distance_matrix[i, j] = distance
-            print(f"二级距离矩阵构建完成")
         else:
             self.secondary_distance_matrix = np.full((self.num_demands, 0), np.inf)
 
@@ -250,7 +251,7 @@ class MultiObjectiveGA:
         # 检查低能人群距离约束（只能到一级）
         for i in range(self.num_demands):
             j = vulnerable_assignment[i]
-            if j != -1 and self.primary_distance_matrix[i, j] > self.dmax:
+            if j != -1 and self.primary_distance_matrix[i, j] > self.dmax_vulnerable:
                 return False
 
         # 检查健全人群距离约束
@@ -259,10 +260,10 @@ class MultiObjectiveGA:
             if assign is not None:
                 gp_type, j = assign
                 if gp_type == 'primary':
-                    if self.primary_distance_matrix[i, j] > self.dmax:
+                    if self.primary_distance_matrix[i, j] > self.dmax_able:
                         return False
-                else:  # secondary
-                    if self.secondary_distance_matrix[i, j] > self.dmax:
+                else:
+                    if self.secondary_distance_matrix[i, j] > self.dmax_able:
                         return False
 
         return True
@@ -302,7 +303,7 @@ class MultiObjectiveGA:
                 if vuln_demand > 0:
                     feasible_primary = []
                     for j in range(self.num_primary_gp):
-                        if (self.primary_distance_matrix[i, j] <= self.dmax and
+                        if (self.primary_distance_matrix[i, j] <= self.dmax_vulnerable and
                                 primary_remaining[j] >= vuln_demand):
                             feasible_primary.append(j)
 
@@ -319,15 +320,15 @@ class MultiObjectiveGA:
                 if able_demand > 0:
                     feasible_options = []
 
-                    # 检查一级集合点
+                    # 检查一级集合点（健全人群阈值）
                     for j in range(self.num_primary_gp):
-                        if (self.primary_distance_matrix[i, j] <= self.dmax and
+                        if (self.primary_distance_matrix[i, j] <= self.dmax_able and
                                 primary_remaining[j] >= able_demand):
                             feasible_options.append(('primary', j))
 
-                    # 检查二级集合点
+                    # 检查二级集合点（健全人群阈值）
                     for j in range(self.num_secondary_gp):
-                        if (self.secondary_distance_matrix[i, j] <= self.dmax and
+                        if (self.secondary_distance_matrix[i, j] <= self.dmax_able and
                                 secondary_remaining[j] >= able_demand):
                             feasible_options.append(('secondary', j))
 
@@ -578,7 +579,7 @@ class MultiObjectiveGA:
                 # 找可行的一级集合点
                 feasible = []
                 for j in range(self.num_primary_gp):
-                    if j != current_j and self.primary_distance_matrix[i, j] <= self.dmax:
+                    if j != current_j and self.primary_distance_matrix[i, j] <= self.dmax_vulnerable:
                         feasible.append(j)
 
                 if feasible:
@@ -586,7 +587,6 @@ class MultiObjectiveGA:
 
         else:
             # === 变异健全人群分配（可以切换到一级或二级）===
-            # 找到有健全人群需求的需求点
             valid_demands = [i for i in range(self.num_demands) if self.able_demands[i] > 0]
 
             if valid_demands:
@@ -598,14 +598,14 @@ class MultiObjectiveGA:
 
                 # 检查一级集合点
                 for j in range(self.num_primary_gp):
-                    if self.primary_distance_matrix[i, j] <= self.dmax:
+                    if self.primary_distance_matrix[i, j] <= self.dmax_able:
                         option = ('primary', j)
                         if current != option:
                             feasible.append(option)
 
                 # 检查二级集合点
                 for j in range(self.num_secondary_gp):
-                    if self.secondary_distance_matrix[i, j] <= self.dmax:
+                    if self.secondary_distance_matrix[i, j] <= self.dmax_able:
                         option = ('secondary', j)
                         if current != option:
                             feasible.append(option)
