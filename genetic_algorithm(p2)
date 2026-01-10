@@ -46,7 +46,7 @@
 
         # ---------- 工具函数：检查某个需求点 i 能否把低能人群移到指定一级点 ----------
         def can_move_vuln_to_primary(i: int, k: int) -> bool:
-            return (self.primary_distance_matrix[i, k] <= self.dmax_able and
+            return (self.primary_distance_matrix[i, k] <= self.dmax_vulnerable and
                     primary_load[k] + self.vulnerable_demands[i] <= self.primary_capacities[k])
 
         # 1) 修复一级集合点超容量
@@ -476,7 +476,7 @@
                              c=color, alpha=0.5, linewidth=1)
 
         ax2.set_title(f'最佳分配方案\n加权距离: {best_solution["objectives"][0]:.1f}, '
-                      f'加权穿越: {best_solution["objectives"][1]:. 1f}', fontsize=12)
+                      f'加权穿越: {best_solution["objectives"][1]:.1f}', fontsize=12)
 
         # 添加图例
         legend_elements = [
