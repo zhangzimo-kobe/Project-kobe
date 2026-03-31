@@ -331,7 +331,7 @@ class RoadNetworkSelector:
         self.btn_shelter = Button(ax_shelter, 'Shelter')
         self.btn_shelter.on_clicked(self.toggle_shelter)
 
-        def draw_map(self, preserve_view=True):
+    def draw_map(self, preserve_view=True):
         if preserve_view:
             try:
                 xlim = self.ax.get_xlim()
