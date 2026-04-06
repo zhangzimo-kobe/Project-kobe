@@ -1,4 +1,275 @@
-     def select_arterial(self, event):
+         def toggle_primary_gathering(self, event):
+        """切换到一级集合点选择模式"""
+        if self.mode == 'primary_gathering':
+            self.mode = 'edges'
+            self.btn_primary_gp.label.set_text('Primary GP')
+        else:
+            self.mode = 'primary_gathering'
+            self.btn_primary_gp.label.set_text('Switch to Road')
+            self.shelter_visible = True
+        self.temp_edge = []
+        self.draw_map()
+
+    def toggle_secondary_gathering(self, event):
+        """切换到二级集合点选择模式"""
+        if self.mode == 'secondary_gathering':
+            self.mode = 'edges'
+            self.btn_secondary_gp.label.set_text('Secondary GP')
+        else:
+            self.mode = 'secondary_gathering'
+            self.btn_secondary_gp.label.set_text('Switch to Road')
+            self.shelter_visible = True
+        self.temp_edge = []
+        self.draw_map()
+
+    def toggle_final_shelter_mode(self, event):
+        """切换到二阶段最终避难所(门)选择模式：必须点击 Shelter 点，并输入容量"""
+        if self.mode == 'final_shelter':
+            self.mode = 'edges'   # 或者你更喜欢切回 'nodes'
+            self.btn_final_shelter.label.set_text('Final Shelter')
+        else:
+            self.mode = 'final_shelter'
+            self.btn_final_shelter.label.set_text('Switch to Road')
+            self.shelter_visible = True  # 进入该模式时自动显示 shelter 点，方便点选
+
+        self.temp_edge = []
+        self.draw_map()
+
+    def toggle_tsunami(self, event):
+        """切换海啸灾害显示"""
+        self.disaster_visible['Tsunami'] = not self.disaster_visible['Tsunami']
+        status = "显示" if self.disaster_visible['Tsunami'] else "隐藏"
+        print(f"海啸灾害图层: {status}")
+        self.draw_map()
+
+    def toggle_landslide(self, event):
+        """切换山体滑坡灾害显示"""
+        self.disaster_visible['Landslide'] = not self.disaster_visible['Landslide']
+        status = "显示" if self.disaster_visible['Landslide'] else "隐藏"
+        print(f"山体滑坡灾害图层: {status}")
+        self.draw_map()
+
+    def toggle_flood(self, event):
+        """切换洪水灾害显示"""
+        self.disaster_visible['Flood'] = not self.disaster_visible['Flood']
+        status = "显示" if self.disaster_visible['Flood'] else "隐藏"
+        print(f"洪水灾害图层: {status}")
+        self.draw_map()
+
+    def zoom_in(self, event):
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        xmid = (xlim[0] + xlim[1]) / 2
+        ymid = (ylim[0] + ylim[1]) / 2
+        scale = 0.5
+        xdelta = (xlim[1] - xlim[0]) * scale / 2
+        ydelta = (ylim[1] - ylim[0]) * scale / 2
+        self.ax.set_xlim([xmid - xdelta, xmid + xdelta])
+        self.ax.set_ylim([ymid - ydelta, ymid + ydelta])
+        self.fig.canvas.draw_idle()
+
+    def zoom_out(self, event):
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        xmid = (xlim[0] + xlim[1]) / 2
+        ymid = (ylim[0] + ylim[1]) / 2
+        scale = 2.0
+        xdelta = (xlim[1] - xlim[0]) * scale / 2
+        ydelta = (ylim[1] - ylim[0]) * scale / 2
+        self.ax.set_xlim([xmid - xdelta, xmid + xdelta])
+        self.ax.set_ylim([ymid - ydelta, ymid + ydelta])
+        self.fig.canvas.draw_idle()
+
+    def zoom_reset(self, event):
+        if hasattr(self, '_init_view') and self._init_view is not None:
+            self.ax.set_xlim(self._init_view[0])
+            self.ax.set_ylim(self._init_view[1])
+            self.fig.canvas.draw_idle()
+
+    def select_node(self, event):  # 点击节点 → 红色高亮，再点一次取消
+        self.save_history()
+        x, y = event.xdata, event.ydata
+        click_point = Point(x, y)
+        min_dist = float('inf')
+        nearest_node = None
+        for node_id, node_data in self.nodes.iterrows():
+            node_geom = node_data.geometry
+            dist = node_geom.distance(click_point)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_node = node_id
+        if nearest_node is not None and min_dist < 100:
+            if nearest_node in self.selected_nodes:
+                self.selected_nodes.remove(nearest_node)
+                print(f"Node canceled: {nearest_node}")
+            else:
+                self.selected_nodes.add(nearest_node)
+                print(f"Node Selected: {nearest_node}")
+            self.draw_map()
+
+    def select_primary_gathering_point(self, event):
+        self.save_history()
+        x, y = event.xdata, event.ydata
+
+        shelter = self._find_nearest_shelter(x, y, threshold=80)
+        if shelter is None:
+            print("提示：请点击避难所点（Primary GP 模式下不允许直接点任意节点）")
+            return
+
+        nearest_node = int(shelter["nearest_node"])
+
+        if nearest_node in self.primary_gathering_points:
+            self.primary_gathering_points.remove(nearest_node)
+            self.primary_capacities.pop(nearest_node, None)
+            print(f"取消选择一级集合点(避难所映射节点): {nearest_node}")
+        else:
+            if nearest_node in self.secondary_gathering_points:
+                print(f"错误：节点 {nearest_node} 已是二级集合点，不能同时是两种集合点")
+                return
+
+            self.primary_gathering_points.add(nearest_node)
+            self.selected_nodes.add(nearest_node)
+
+            try:
+                capacity = int(input(f"请输入一级集合点 {nearest_node} 的容量: "))
+                if capacity > 0:
+                    self.primary_capacities[nearest_node] = capacity
+                    print(f"一级集合点已选择: {nearest_node}, 容量: {capacity}")
+                else:
+                    print("错误：容量必须为正整数")
+            except Exception as e:
+                print(f"输入错误: {e}")
+
+        self.draw_map()
+
+    def select_secondary_gathering_point(self, event):
+        self.save_history()
+        x, y = event.xdata, event.ydata
+
+        shelter = self._find_nearest_shelter(x, y, threshold=80)
+        if shelter is None:
+            print("提示：请点击避难所点（Secondary GP 模式下不允许直接点任意节点）")
+            return
+
+        nearest_node = int(shelter["nearest_node"])
+
+        if nearest_node in self.secondary_gathering_points:
+            self.secondary_gathering_points.remove(nearest_node)
+            self.secondary_capacities.pop(nearest_node, None)
+            print(f"取消选择二级集合点(避难所映射节点): {nearest_node}")
+        else:
+            if nearest_node in self.primary_gathering_points:
+                print(f"错误：节点 {nearest_node} 已是一级集合点，不能同时是两种集合点")
+                return
+
+            self.secondary_gathering_points.add(nearest_node)
+            self.selected_nodes.add(nearest_node)
+
+            try:
+                capacity = int(input(f"请输入二级集合点 {nearest_node} 的容量: "))
+                if capacity > 0:
+                    self.secondary_capacities[nearest_node] = capacity
+                    print(f"二级集合点已选择: {nearest_node}, 容量: {capacity}")
+                else:
+                    print("错误：容量必须为正整数")
+            except Exception as e:
+                print(f"输入错误: {e}")
+
+        self.draw_map()
+
+    def select_final_shelter(self, event):
+        """在 Final Shelter 模式下：只能点击 Shelter 点；映射到 nearest_node；输入容量"""
+        self.save_history()
+        x, y = event.xdata, event.ydata
+
+        shelter = self._find_nearest_shelter(x, y, threshold=80)
+        if shelter is None:
+            print("提示：请点击避难所点（Final Shelter 模式下不允许直接点任意节点）")
+            return
+
+        nearest_node = int(shelter["nearest_node"])
+
+        if nearest_node in self.final_shelter_nodes:
+            self.final_shelter_nodes.remove(nearest_node)
+            self.final_shelter_capacities.pop(nearest_node, None)
+            print(f"取消选择最终避难所(映射节点): {nearest_node}")
+        else:
+            self.final_shelter_nodes.add(nearest_node)
+
+            try:
+                capacity = int(input(f"请输入最终避难所 {nearest_node} 的容量: "))
+                if capacity > 0:
+                    self.final_shelter_capacities[nearest_node] = capacity
+                    print(f"最终避难所已选择: {nearest_node}, 容量: {capacity}")
+                else:
+                    print("错误：容量必须为正整数")
+            except Exception as e:
+                print(f"输入错误: {e}")
+
+        self.draw_map()
+
+    def select_edge(self, event):
+        self.save_history()
+        x, y = event.xdata, event.ydata
+        click_point = Point(x, y)
+        min_node_dist = float('inf')
+        nearest_node = None
+        for node_id, node_data in self.nodes.iterrows():  # 看是不是点击的节点
+            node_geom = node_data.geometry
+            dist = node_geom.distance(click_point)
+            if dist < min_node_dist:
+                min_node_dist = dist
+                nearest_node = node_id
+
+        node_threshold = 40
+        if min_node_dist >= node_threshold:  # 点的不是节点的话，看是不是点的边，点的边就会取消这条边
+            min_edge_dist = float('inf')
+            nearest_edge = None
+            for edge_idx in self.selected_edges:
+                if edge_idx in self.edges.index:
+                    edge_geom = self.edges.loc[edge_idx].geometry
+                    dist = edge_geom.distance(click_point)
+                    if dist < min_edge_dist:
+                        min_edge_dist = dist
+                        nearest_edge = edge_idx
+            if nearest_edge is not None and min_edge_dist < 30:
+                self.selected_edges.remove(nearest_edge)
+                if nearest_edge in self.arterial_edges:
+                    self.arterial_edges.remove(nearest_edge)
+                print(f"Road cancel: {nearest_edge}")
+                self.draw_map()
+                return
+
+        if nearest_node is not None and min_node_dist < 100:  # 判断点击在了节点上了后
+            self.temp_edge.append(nearest_node)
+            print(f"选择节点: {nearest_node}")
+            if len(self.temp_edge) == 2:  # 两次点击选择最短路径（普通道路）
+                start_node, end_node = self.temp_edge
+                path = self.find_shortest_path(start_node, end_node)
+                if path:
+                    if not hasattr(self, 'selected_path_nodes'):
+                        self.selected_path_nodes = set()
+                    for u, v, k in self.selected_edges:
+                        self.selected_path_nodes.add(u)
+                        self.selected_path_nodes.add(v)
+                    path_set = set(path)
+                    self.selected_nodes.add(start_node)
+                    self.selected_nodes.add(end_node)
+                    common_nodes = path_set & self.selected_path_nodes
+                    for node in common_nodes:
+                        self.selected_nodes.add(node)
+                    self.selected_path_nodes.update(path_set)
+                    for i in range(len(path) - 1):
+                        u, v = path[i], path[i + 1]
+                        if self.original_G.has_edge(u, v):
+                            for k in self.original_G.get_edge_data(u, v).keys():
+                                self.selected_edges.add((u, v, k))
+                                print(f"添加边: ({u}, {v}, {k})")
+                    print(f"Edge from{start_node} to {end_node} has been selected")
+                self.temp_edge = []
+            self.draw_map()
+
+    def select_arterial(self, event):
         self.save_history()
         x, y = event.xdata, event.ydata
         click_point = Point(x, y)
@@ -278,315 +549,3 @@
                     print(f"  └─ 平均距离: {avg_dist:.1f}米")
                 else:
                     print(f"  └─ ❌ 无可达二级集合点")
-
-    def visualize_distance_matrix(self):
-        """可视化一级和二级集合点的距离矩阵和穿越次数矩阵"""
-
-        # 计算穿越次数矩阵
-        self.calculate_crossing_matrix()
-
-        # 确定需要显示的子图数量
-        num_plots = 0
-        if self.primary_distance_matrix is not None:
-            num_plots += 2  # 一级距离 + 一级穿越
-        if self.secondary_distance_matrix is not None:
-            num_plots += 2  # 二级距离 + 二级穿越
-
-        if num_plots == 0:
-            print("没有可视化的矩阵")
-            return
-
-        # 创建子图
-        fig, axes = plt.subplots(2, 2, figsize=(18, 14))
-        axes = axes.flatten()
-        plot_idx = 0
-
-        # === 一级集合点距离矩阵 ===
-        if self.primary_distance_matrix is not None:
-            distance_array = self.primary_distance_matrix.values
-            ax = axes[plot_idx]
-
-            im = ax.imshow(distance_array, cmap='viridis', aspect='auto')
-            ax.set_title('Primary GP - Distance Matrix (meters)', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Primary Gathering Points', fontsize=12)
-            ax.set_ylabel('Demand Points', fontsize=12)
-
-            num_rows, num_cols = distance_array.shape
-            ax.set_xticks(range(num_cols))
-            ax.set_yticks(range(num_rows))
-            ax.set_xticklabels([f'P1-{i + 1}' for i in range(num_cols)])
-            ax.set_yticklabels([f'D{i + 1}' for i in range(num_rows)])
-
-            # 添加数值标注
-            for i in range(num_rows):
-                for j in range(num_cols):
-                    distance = distance_array[i, j]
-                    if not np.isinf(distance) and not np.isnan(distance):
-                        text = f'{distance:.0f}'
-                        valid_values = distance_array[~np.isinf(distance_array) & ~np.isnan(distance_array)]
-                        if len(valid_values) > 0:
-                            max_val = np.max(valid_values)
-                            color = 'white' if distance > max_val * 0.5 else 'black'
-                        else:
-                            color = 'black'
-                        ax.text(j, i, text, ha='center', va='center', color=color, fontsize=8)
-                    else:
-                        ax.text(j, i, '∞', ha='center', va='center', color='red', fontsize=8)
-
-            plt.colorbar(im, ax=ax, shrink=0.8).set_label('Distance (meters)', fontsize=10)
-            plot_idx += 1
-
-        # === 一级集合点穿越次数矩阵 ===
-        if hasattr(self, 'primary_crossing_matrix') and self.primary_crossing_matrix is not None:
-            crossing_array = self.primary_crossing_matrix
-            ax = axes[plot_idx]
-
-            im = ax.imshow(crossing_array, cmap='Reds', aspect='auto')
-            ax.set_title('Primary GP - Crossing Count Matrix', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Primary Gathering Points', fontsize=12)
-            ax.set_ylabel('Demand Points', fontsize=12)
-
-            cross_rows, cross_cols = crossing_array.shape
-            ax.set_xticks(range(cross_cols))
-            ax.set_yticks(range(cross_rows))
-            ax.set_xticklabels([f'P1-{i + 1}' for i in range(cross_cols)])
-            ax.set_yticklabels([f'D{i + 1}' for i in range(cross_rows)])
-
-            # 添加数值标注
-            for i in range(cross_rows):
-                for j in range(cross_cols):
-                    crossings = crossing_array[i, j]
-                    if crossings >= 0:
-                        max_crossings = np.max(crossing_array[crossing_array >= 0])
-                        color = 'white' if crossings > max_crossings * 0.5 else 'black'
-                        ax.text(j, i, str(crossings), ha='center', va='center', color=color, fontsize=10,
-                                fontweight='bold')
-                    else:
-                        ax.text(j, i, '-', ha='center', va='center', color='gray', fontsize=10)
-
-            plt.colorbar(im, ax=ax, shrink=0.8).set_label('Crossing Count', fontsize=10)
-            plot_idx += 1
-
-        # === 二级集合点距离矩阵 ===
-        if self.secondary_distance_matrix is not None:
-            distance_array = self.secondary_distance_matrix.values
-            ax = axes[plot_idx]
-
-            im = ax.imshow(distance_array, cmap='viridis', aspect='auto')
-            ax.set_title('Secondary GP - Distance Matrix (meters)', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Secondary Gathering Points', fontsize=12)
-            ax.set_ylabel('Demand Points', fontsize=12)
-
-            num_rows, num_cols = distance_array.shape
-            ax.set_xticks(range(num_cols))
-            ax.set_yticks(range(num_rows))
-            ax.set_xticklabels([f'P2-{i + 1}' for i in range(num_cols)])
-            ax.set_yticklabels([f'D{i + 1}' for i in range(num_rows)])
-
-            # 添加数值标注
-            for i in range(num_rows):
-                for j in range(num_cols):
-                    distance = distance_array[i, j]
-                    if not np.isinf(distance) and not np.isnan(distance):
-                        text = f'{distance:.0f}'
-                        valid_values = distance_array[~np.isinf(distance_array) & ~np.isnan(distance_array)]
-                        if len(valid_values) > 0:
-                            max_val = np.max(valid_values)
-                            color = 'white' if distance > max_val * 0.5 else 'black'
-                        else:
-                            color = 'black'
-                        ax.text(j, i, text, ha='center', va='center', color=color, fontsize=8)
-                    else:
-                        ax.text(j, i, '∞', ha='center', va='center', color='red', fontsize=8)
-
-            plt.colorbar(im, ax=ax, shrink=0.8).set_label('Distance (meters)', fontsize=10)
-            plot_idx += 1
-
-        # === 二级集合点穿越次数矩阵 ===
-        if hasattr(self, 'secondary_crossing_matrix') and self.secondary_crossing_matrix is not None:
-            crossing_array = self.secondary_crossing_matrix
-            ax = axes[plot_idx]
-
-            im = ax.imshow(crossing_array, cmap='Oranges', aspect='auto')
-            ax.set_title('Secondary GP - Crossing Count Matrix', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Secondary Gathering Points', fontsize=12)
-            ax.set_ylabel('Demand Points', fontsize=12)
-
-            cross_rows, cross_cols = crossing_array.shape
-            ax.set_xticks(range(cross_cols))
-            ax.set_yticks(range(cross_rows))
-            ax.set_xticklabels([f'P2-{i + 1}' for i in range(cross_cols)])
-            ax.set_yticklabels([f'D{i + 1}' for i in range(cross_rows)])
-
-            # 添加数值标注
-            for i in range(cross_rows):
-                for j in range(cross_cols):
-                    crossings = crossing_array[i, j]
-                    if crossings >= 0:
-                        max_crossings = np.max(crossing_array[crossing_array >= 0])
-                        color = 'white' if crossings > max_crossings * 0.5 else 'black'
-                        ax.text(j, i, str(crossings), ha='center', va='center', color=color, fontsize=10,
-                                fontweight='bold')
-                    else:
-                        ax.text(j, i, '-', ha='center', va='center', color='gray', fontsize=10)
-
-            plt.colorbar(im, ax=ax, shrink=0.8).set_label('Crossing Count', fontsize=10)
-            plot_idx += 1
-
-        # 隐藏未使用的子图
-        for i in range(plot_idx, 4):
-            axes[i].axis('off')
-
-        plt.tight_layout()
-        plt.show()
-
-        # 打印统计信息
-        print("\n" + "=" * 50)
-        print("矩阵统计信息:")
-        print("=" * 50)
-
-        # 一级集合点统计
-        if self.primary_distance_matrix is not None:
-            print("\n【一级集合点】")
-            distance_array = self.primary_distance_matrix.values
-            valid_distances = distance_array[~np.isinf(distance_array) & ~np.isnan(distance_array)]
-            if len(valid_distances) > 0:
-                print(f"  平均距离: {np.mean(valid_distances):.2f} 米")
-                print(f"  最短距离: {np.min(valid_distances):.2f} 米")
-                print(f"  最长距离: {np.max(valid_distances):.2f} 米")
-
-            if hasattr(self, 'primary_crossing_matrix') and self.primary_crossing_matrix is not None:
-                valid_crossings = self.primary_crossing_matrix[self.primary_crossing_matrix >= 0]
-                if len(valid_crossings) > 0:
-                    print(f"  平均穿越次数: {np.mean(valid_crossings):.2f}")
-                    print(f"  最少穿越次数: {np.min(valid_crossings)}")
-                    print(f"  最多穿越次数: {np.max(valid_crossings)}")
-
-        # 二级集合点统计
-        if self.secondary_distance_matrix is not None:
-            print("\n【二级集合点】")
-            distance_array = self.secondary_distance_matrix.values
-            valid_distances = distance_array[~np.isinf(distance_array) & ~np.isnan(distance_array)]
-            if len(valid_distances) > 0:
-                print(f"  平均距离: {np.mean(valid_distances):.2f} 米")
-                print(f"  最短距离: {np.min(valid_distances):.2f} 米")
-                print(f"  最长距离: {np.max(valid_distances):.2f} 米")
-
-            if hasattr(self, 'secondary_crossing_matrix') and self.secondary_crossing_matrix is not None:
-                valid_crossings = self.secondary_crossing_matrix[self.secondary_crossing_matrix >= 0]
-                if len(valid_crossings) > 0:
-                    print(f"  平均穿越次数: {np.mean(valid_crossings):.2f}")
-                    print(f"  最少穿越次数: {np.min(valid_crossings)}")
-                    print(f"  最多穿越次数: {np.max(valid_crossings)}")
-
-    def finalize_selection(self, event):
-        if len(self.selected_nodes) == 0:
-            print("Haven't select any available node")
-            return
-        if len(self.selected_edges) == 0:
-            print("Haven't select any available edge")
-            return
-
-        self.selected_G = nx.MultiDiGraph()
-        for key, value in self.original_G.graph.items():
-            self.selected_G.graph[key] = value
-        for node_id in self.selected_nodes:
-            if node_id in self.original_G.nodes:
-                node_data = self.original_G.nodes[node_id]
-                if node_id in self.primary_gathering_points:
-                    node_data['gathering_point'] = True
-                    node_data['gathering_type'] = 'primary'
-                elif node_id in self.secondary_gathering_points:
-                    node_data['gathering_point'] = True
-                    node_data['gathering_type'] = 'secondary'
-                self.selected_G.add_node(node_id, **node_data)
-        for u, v, k in self.selected_edges:
-            if self.original_G.has_edge(u, v, key=k):
-                for node in [u, v]:
-                    if node not in self.selected_G.nodes and node in self.original_G.nodes:
-                        node_data = self.original_G.nodes[node]
-                        # 检查是否为一级或二级集合点
-                        if node in self.primary_gathering_points:
-                            node_data['gathering_point'] = True
-                            node_data['gathering_type'] = 'primary'
-                        elif node in self.secondary_gathering_points:
-                            node_data['gathering_point'] = True
-                            node_data['gathering_type'] = 'secondary'
-                        self.selected_G.add_node(node, **node_data)
-                edge_data = self.original_G.get_edge_data(u, v, key=k)
-                edge_data['arterial'] = (u, v, k) in self.arterial_edges
-                self.selected_G.add_edge(u, v, key=k, **edge_data)
-
-        self.display_selected_network()
-
-    def input_demand_quantities(self, event):
-        """手动输入各需求点的低能人群和健全人群疏散需求量"""
-        if not self.region_centroid_nodes:
-            print("错误：没有发现需求点，请先完成选择以识别需求点")
-            return
-
-        print("\n" + "=" * 60)
-        print("请为每个需求点输入疏散需求量（分为低能人群和健全人群）")
-        print("=" * 60)
-
-        for i, (centroid_id, centroid_geom) in enumerate(self.region_centroid_nodes):
-            print(f"\n需求点 {i + 1} (Node ID: {centroid_id})")
-            print(f"坐标: ({centroid_geom.x:.1f}, {centroid_geom.y:.1f})")
-
-            # 输入低能人群需求量
-            while True:
-                try:
-                    vulnerable_str = input(f"请输入需求点 {i + 1} 的【低能人群】需求量（正整数）: ")
-                    vulnerable = int(vulnerable_str)
-                    if vulnerable >= 0:  # 允许为0
-                        self.vulnerable_demand[centroid_id] = vulnerable
-                        print(f"  ✓ 低能人群需求量: {vulnerable}")
-                        break
-                    else:
-                        print("错误：需求量必须为非负整数")
-                except ValueError:
-                    print("错误：请输入有效的整数")
-
-            # 输入健全人群需求量
-            while True:
-                try:
-                    able_str = input(f"请输入需求点 {i + 1} 的【健全人群】需求量（正整数）: ")
-                    able = int(able_str)
-                    if able >= 0:  # 允许为0
-                        self.able_bodied_demand[centroid_id] = able
-                        print(f"  ✓ 健全人群需求量: {able}")
-                        break
-                    else:
-                        print("错误：需求量必须为非负整数")
-                except ValueError:
-                    print("错误：请输入有效的整数")
-
-            # 显示该需求点的总计
-            total = vulnerable + able
-            print(f"  → 需求点 {i + 1} 总需求量: {total} (低能: {vulnerable}, 健全: {able})")
-
-        # 显示所有需求点的汇总
-        print(f"\n" + "=" * 60)
-        print("所有需求点的需求量设置完成")
-        print("=" * 60)
-
-        total_vulnerable = 0
-        total_able = 0
-
-        for i, (centroid_id, _) in enumerate(self.region_centroid_nodes):
-            vuln = self.vulnerable_demand.get(centroid_id, 0)
-            able = self.able_bodied_demand.get(centroid_id, 0)
-            total = vuln + able
-
-            print(f"需求点 {i + 1} (Node {centroid_id}):")
-            print(f"  ├─ 低能人群: {vuln}")
-            print(f"  ├─ 健全人群: {able}")
-            print(f"  └─ 总计: {total}")
-
-            total_vulnerable += vuln
-            total_able += able
-
-        print(f"\n总需求量汇总:")
-        print(f"  ├─ 总低能人群: {total_vulnerable}")
-        print(f"  ├─ 总健全人群: {total_able}")
-        print(f"  └─ 总计: {total_vulnerable + total_able}")
