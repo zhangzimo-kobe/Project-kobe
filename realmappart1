@@ -50,10 +50,15 @@ class RoadNetworkSelector:
         self.primary_shortest_paths = {}
         self.secondary_shortest_paths = {}
         self.mode = 'nodes'
+        self.final_shelter_nodes = set()
+        self.final_shelter_capacities = dict()
+        self.final_shelter_visible = True
+        self.current_solution = None
+        self.gp_total_demand = None
         self.selecting = False
         self.temp_edge = []
-        self._history = []  # 撤销历史栈
-        self.disaster_data = {}  # 存储灾害数据
+        self._history = []
+        self.disaster_data = {}
         self.disaster_visible = {
             'Tsunami': False,
             'Landslide': False,
@@ -88,11 +93,13 @@ class RoadNetworkSelector:
 
             if gdf.crs != self.nodes.crs:
                 gdf = gdf.to_crs(self.nodes.crs)
-                xs = gdf.geometry.x.to_numpy()
-                ys = gdf.geometry.y.to_numpy()
-                gdf["nearest_node"] = ox.distance.nearest_nodes(self.original_G, xs, ys)
-                self._shelter_xy = np.column_stack([xs, ys])
-                self.shelter_gdf = gdf
+
+            xs = gdf.geometry.x.to_numpy()
+            ys = gdf.geometry.y.to_numpy()
+            gdf["nearest_node"] = ox.distance.nearest_nodes(self.original_G, xs, ys)
+            self._shelter_xy = np.column_stack([xs, ys])
+
+            self.shelter_gdf = gdf
             self.shelter_gdf = gdf
             print(f"✓ 成功加载避难所数据: {self.shelter_path}（{len(gdf)} 个点）")
 
@@ -112,6 +119,20 @@ class RoadNetworkSelector:
         if dists[idx] > threshold:
             return None
         return self.shelter_gdf.iloc[idx]
+    def draw_shelters(self):
+        """在地图上绘制避难所点"""
+        if not self.shelter_visible:
+            return
+        if self.shelter_gdf is None:
+            return
+
+        self.shelter_gdf.plot(
+            ax=self.ax,
+            color="magenta",
+            markersize=35,
+            alpha=0.9,
+            zorder=11
+        )
 
     def toggle_shelter(self, event):
         """切换避难所点显示"""
@@ -331,7 +352,17 @@ class RoadNetworkSelector:
         self.btn_shelter = Button(ax_shelter, 'Shelter')
         self.btn_shelter.on_clicked(self.toggle_shelter)
 
+        # --- Stage 2 buttons (bus) ---
+        ax_final_shelter = plt.axes([0.14, 0.10, 0.12, 0.06])
+        self.btn_final_shelter = Button(ax_final_shelter, 'Final Shelter')
+        self.btn_final_shelter.on_clicked(self.toggle_final_shelter_mode)
+
+        ax_runbus = plt.axes([0.28, 0.10, 0.12, 0.06])
+        self.btn_runbus = Button(ax_runbus, 'Run Bus')
+        self.btn_runbus.on_clicked(self.run_bus_assignment)
+
     def draw_map(self, preserve_view=True):
+        subtitle = f"Mode: {self.mode}"
         if preserve_view:
             try:
                 xlim = self.ax.get_xlim()
@@ -356,11 +387,14 @@ class RoadNetworkSelector:
         node_colors = ['lightgrey'] * len(self.nodes)
         node_sizes = [30] * len(self.nodes)
         for i, node_id in enumerate(self.nodes.index):
-            if node_id in self.primary_gathering_points:
-                node_colors[i] = 'darkgreen'  # 一级集合点用深绿色
+            if node_id in self.final_shelter_nodes:
+                node_colors[i] = 'purple'
+                node_sizes[i] = 170
+            elif node_id in self.primary_gathering_points:
+                node_colors[i] = 'darkgreen'
                 node_sizes[i] = 150
             elif node_id in self.secondary_gathering_points:
-                node_colors[i] = 'lightgreen'  # 二级集合点用浅绿色
+                node_colors[i] = 'lightgreen'
                 node_sizes[i] = 120
             elif node_id in self.selected_nodes:
                 node_colors[i] = 'red'
@@ -409,6 +443,15 @@ class RoadNetworkSelector:
                 self.ax.text(node_geom.x + 10, node_geom.y - 10, f"P2-Cap: {cap}",
                              fontsize=10, color='green', ha='left', va='top',
                              bbox=dict(facecolor='white', alpha=0.7, edgecolor='green', boxstyle='round,pad=0.2'))
+
+        # 显示最终避难所容量（紫色）
+        for node_id in self.final_shelter_nodes:
+            if node_id in self.final_shelter_capacities:
+                node_geom = self.nodes.loc[node_id].geometry
+                cap = self.final_shelter_capacities[node_id]
+                self.ax.text(node_geom.x + 10, node_geom.y + 25, f"FS-Cap: {cap}",
+                             fontsize=10, color='purple', ha='left', va='bottom',
+                             bbox=dict(facecolor='white', alpha=0.7, edgecolor='purple', boxstyle='round,pad=0.2'))
 
         if not hasattr(self, '_init_view') or self._init_view is None:
             self._init_view = (self.ax.get_xlim(), self.ax.get_ylim())
@@ -483,6 +526,8 @@ class RoadNetworkSelector:
             self.select_primary_gathering_point(event)
         elif self.mode == 'secondary_gathering':
             self.select_secondary_gathering_point(event)
+        elif self.mode == 'final_shelter':
+            self.select_final_shelter(event)
 
     def toggle_mode(self, event):  # 在节点模式和道路选择模式中切换
         if self.mode == 'nodes':
@@ -503,230 +548,3 @@ class RoadNetworkSelector:
             self.btn_arterial.label.set_text('Switch to Road Selection')
         self.temp_edge = []
         self.draw_map()
-
-    def toggle_primary_gathering(self, event):
-        """切换到一级集合点选择模式"""
-        if self.mode == 'primary_gathering':
-            self.mode = 'edges'
-            self.btn_primary_gp.label.set_text('Primary GP')
-        else:
-            self.mode = 'primary_gathering'
-            self.btn_primary_gp.label.set_text('Switch to Road')
-            self.shelter_visible = True
-        self.temp_edge = []
-        self.draw_map()
-
-    def toggle_secondary_gathering(self, event):
-        """切换到二级集合点选择模式"""
-        if self.mode == 'secondary_gathering':
-            self.mode = 'edges'
-            self.btn_secondary_gp.label.set_text('Secondary GP')
-        else:
-            self.mode = 'secondary_gathering'
-            self.btn_secondary_gp.label.set_text('Switch to Road')
-            self.shelter_visible = True
-        self.temp_edge = []
-        self.draw_map()
-
-    def toggle_tsunami(self, event):
-        """切换海啸灾害显示"""
-        self.disaster_visible['Tsunami'] = not self.disaster_visible['Tsunami']
-        status = "显示" if self.disaster_visible['Tsunami'] else "隐藏"
-        print(f"海啸灾害图层: {status}")
-        self.draw_map()
-
-    def toggle_landslide(self, event):
-        """切换山体滑坡灾害显示"""
-        self.disaster_visible['Landslide'] = not self.disaster_visible['Landslide']
-        status = "显示" if self.disaster_visible['Landslide'] else "隐藏"
-        print(f"山体滑坡灾害图层: {status}")
-        self.draw_map()
-
-    def toggle_flood(self, event):
-        """切换洪水灾害显示"""
-        self.disaster_visible['Flood'] = not self.disaster_visible['Flood']
-        status = "显示" if self.disaster_visible['Flood'] else "隐藏"
-        print(f"洪水灾害图层: {status}")
-        self.draw_map()
-
-    def zoom_in(self, event):
-        xlim = self.ax.get_xlim()
-        ylim = self.ax.get_ylim()
-        xmid = (xlim[0] + xlim[1]) / 2
-        ymid = (ylim[0] + ylim[1]) / 2
-        scale = 0.5
-        xdelta = (xlim[1] - xlim[0]) * scale / 2
-        ydelta = (ylim[1] - ylim[0]) * scale / 2
-        self.ax.set_xlim([xmid - xdelta, xmid + xdelta])
-        self.ax.set_ylim([ymid - ydelta, ymid + ydelta])
-        self.fig.canvas.draw_idle()
-
-    def zoom_out(self, event):
-        xlim = self.ax.get_xlim()
-        ylim = self.ax.get_ylim()
-        xmid = (xlim[0] + xlim[1]) / 2
-        ymid = (ylim[0] + ylim[1]) / 2
-        scale = 2.0
-        xdelta = (xlim[1] - xlim[0]) * scale / 2
-        ydelta = (ylim[1] - ylim[0]) * scale / 2
-        self.ax.set_xlim([xmid - xdelta, xmid + xdelta])
-        self.ax.set_ylim([ymid - ydelta, ymid + ydelta])
-        self.fig.canvas.draw_idle()
-
-    def zoom_reset(self, event):
-        if hasattr(self, '_init_view') and self._init_view is not None:
-            self.ax.set_xlim(self._init_view[0])
-            self.ax.set_ylim(self._init_view[1])
-            self.fig.canvas.draw_idle()
-
-    def select_node(self, event):  # 点击节点 → 红色高亮，再点一次取消
-        self.save_history()
-        x, y = event.xdata, event.ydata
-        click_point = Point(x, y)
-        min_dist = float('inf')
-        nearest_node = None
-        for node_id, node_data in self.nodes.iterrows():
-            node_geom = node_data.geometry
-            dist = node_geom.distance(click_point)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_node = node_id
-        if nearest_node is not None and min_dist < 100:
-            if nearest_node in self.selected_nodes:
-                self.selected_nodes.remove(nearest_node)
-                print(f"Node canceled: {nearest_node}")
-            else:
-                self.selected_nodes.add(nearest_node)
-                print(f"Node Selected: {nearest_node}")
-            self.draw_map()
-
-    def select_primary_gathering_point(self, event):
-        self.save_history()
-        x, y = event.xdata, event.ydata
-
-        shelter = self._find_nearest_shelter(x, y, threshold=80)
-        if shelter is None:
-            print("提示：请点击避难所点（Primary GP 模式下不允许直接点任意节点）")
-            return
-
-        nearest_node = int(shelter["nearest_node"])
-
-        if nearest_node in self.primary_gathering_points:
-            self.primary_gathering_points.remove(nearest_node)
-            self.primary_capacities.pop(nearest_node, None)
-            print(f"取消选择一级集合点(避难所映射节点): {nearest_node}")
-        else:
-            if nearest_node in self.secondary_gathering_points:
-                print(f"错误：节点 {nearest_node} 已是二级集合点，不能同时是两种集合点")
-                return
-
-            self.primary_gathering_points.add(nearest_node)
-            self.selected_nodes.add(nearest_node)
-
-            try:
-                capacity = int(input(f"请输入一级集合点 {nearest_node} 的容量: "))
-                if capacity > 0:
-                    self.primary_capacities[nearest_node] = capacity
-                    print(f"一级集合点已选择: {nearest_node}, 容量: {capacity}")
-                else:
-                    print("错误：容量必须为正整数")
-            except Exception as e:
-                print(f"输入错误: {e}")
-
-        self.draw_map()
-
-    def select_secondary_gathering_point(self, event):
-        self.save_history()
-        x, y = event.xdata, event.ydata
-
-        shelter = self._find_nearest_shelter(x, y, threshold=80)
-        if shelter is None:
-            print("提示：请点击避难所点（Secondary GP 模式下不允许直接点任意节点）")
-            return
-
-        nearest_node = int(shelter["nearest_node"])
-
-        if nearest_node in self.secondary_gathering_points:
-            self.secondary_gathering_points.remove(nearest_node)
-            self.secondary_capacities.pop(nearest_node, None)
-            print(f"取消选择二级集合点(避难所映射节点): {nearest_node}")
-        else:
-            if nearest_node in self.primary_gathering_points:
-                print(f"错误：节点 {nearest_node} 已是一级集合点，不能同时是两种集合点")
-                return
-
-            self.secondary_gathering_points.add(nearest_node)
-            self.selected_nodes.add(nearest_node)
-
-            try:
-                capacity = int(input(f"请输入二级集合点 {nearest_node} 的容量: "))
-                if capacity > 0:
-                    self.secondary_capacities[nearest_node] = capacity
-                    print(f"二级集合点已选择: {nearest_node}, 容量: {capacity}")
-                else:
-                    print("错误：容量必须为正整数")
-            except Exception as e:
-                print(f"输入错误: {e}")
-
-        self.draw_map()
-
-    def select_edge(self, event):
-        self.save_history()
-        x, y = event.xdata, event.ydata
-        click_point = Point(x, y)
-        min_node_dist = float('inf')
-        nearest_node = None
-        for node_id, node_data in self.nodes.iterrows():  # 看是不是点击的节点
-            node_geom = node_data.geometry
-            dist = node_geom.distance(click_point)
-            if dist < min_node_dist:
-                min_node_dist = dist
-                nearest_node = node_id
-
-        node_threshold = 40
-        if min_node_dist >= node_threshold:  # 点的不是节点的话，看是不是点的边，点的边就会取消这条边
-            min_edge_dist = float('inf')
-            nearest_edge = None
-            for edge_idx in self.selected_edges:
-                if edge_idx in self.edges.index:
-                    edge_geom = self.edges.loc[edge_idx].geometry
-                    dist = edge_geom.distance(click_point)
-                    if dist < min_edge_dist:
-                        min_edge_dist = dist
-                        nearest_edge = edge_idx
-            if nearest_edge is not None and min_edge_dist < 30:
-                self.selected_edges.remove(nearest_edge)
-                if nearest_edge in self.arterial_edges:
-                    self.arterial_edges.remove(nearest_edge)
-                print(f"Road cancel: {nearest_edge}")
-                self.draw_map()
-                return
-
-        if nearest_node is not None and min_node_dist < 100:  # 判断点击在了节点上了后
-            self.temp_edge.append(nearest_node)
-            print(f"选择节点: {nearest_node}")
-            if len(self.temp_edge) == 2:  # 两次点击选择最短路径（普通道路）
-                start_node, end_node = self.temp_edge
-                path = self.find_shortest_path(start_node, end_node)
-                if path:
-                    if not hasattr(self, 'selected_path_nodes'):
-                        self.selected_path_nodes = set()
-                    for u, v, k in self.selected_edges:
-                        self.selected_path_nodes.add(u)
-                        self.selected_path_nodes.add(v)
-                    path_set = set(path)
-                    self.selected_nodes.add(start_node)
-                    self.selected_nodes.add(end_node)
-                    common_nodes = path_set & self.selected_path_nodes
-                    for node in common_nodes:
-                        self.selected_nodes.add(node)
-                    self.selected_path_nodes.update(path_set)
-                    for i in range(len(path) - 1):
-                        u, v = path[i], path[i + 1]
-                        if self.original_G.has_edge(u, v):
-                            for k in self.original_G.get_edge_data(u, v).keys():
-                                self.selected_edges.add((u, v, k))
-                                print(f"添加边: ({u}, {v}, {k})")
-                    print(f"Edge from{start_node} to {end_node} has been selected")
-                self.temp_edge = []
-            self.draw_map()
