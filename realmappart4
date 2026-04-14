@@ -8,23 +8,58 @@
             print("错误：没有选择最终避难所(门)。请点击 'Final Shelter' 按钮进入模式并点选避难所、输入容量。")
             return
 
-        # 这里先不实现细节，等你确认 UI 部分OK后，我会给你 bus_assignment.py
-        try:
-            from bus_assignment import solve_bus_stage2  # 我后面给你的新文件里会提供这个函数
+                try:
+            from bus_assignment import solve_bus_stage2_timesliced_edgeflow
 
-            result = solve_bus_stage2(
+            # ====== 1) Jamei 曲线（4个时段，和为1）=====
+            # 先用一个“前慢-中快-后慢”的示例，之后你再换成真正Jamei曲线计算出来的值
+            period_shares = [0.15, 0.35, 0.35, 0.15]
+
+            # ====== 2) 道路通行能力 dict：cap_vehph[(u,v,k,t)] = vehicles/hour ======
+            # 先用一个“所有边同一容量”的默认版本跑通；你后续再按道路等级/灾害/时段改
+            T = len(period_shares)
+            vehph_default = 15.0  # 每小时15辆公交（示例）
+            edge_cap_vehph = {}
+            for u, v, k in self.original_G.edges(keys=True):
+                u, v, k = int(u), int(v), int(k)
+                for t in range(T):
+                    edge_cap_vehph[(u, v, k, t)] = vehph_default
+
+            result = solve_bus_stage2_timesliced_edgeflow(
                 G=self.original_G,
                 gp_total_demand=self.gp_total_demand,
                 final_shelter_capacities=self.final_shelter_capacities,
-                weight='length'
+                edge_cap_vehph=edge_cap_vehph,
+                period_shares=period_shares,
+                weight="length",
+                vehicle_capacity=50,
+                period_hours=2.0,
+                super_sink_node=-999999,  # 保证这个ID不在图里
+                msg=True,
             )
 
-            # 你可以把 result 存起来，后续可视化
             self.bus_result = result
-            print("\n✅ 二阶段公交分配完成")
+            print("\n✅ 二阶段公交分配完成（分时段 + 道路容量 + 超级汇点）")
             print(result.get("summary", result))
+
+            # （可选）额外打印：每个时段总疏散量 & 每个避难所总进入
+            res_obj = result.get("result")
+            if res_obj is not None and hasattr(res_obj, "gp_outflow_by_period"):
+                print("\n各时段总疏散量：")
+                for t in range(T):
+                    tot = sum(res_obj.gp_outflow_by_period.get((gp, t), 0.0) for gp in self.gp_total_demand.keys())
+                    print(f"  period {t}: {tot:.2f}")
+
+            if res_obj is not None and hasattr(res_obj, "shelter_inflow_total"):
+                print("\n各避难所总进入：")
+                for sh, inflow in res_obj.shelter_inflow_total.items():
+                    cap = float(self.final_shelter_capacities.get(sh, 0))
+                    util = (inflow / cap) if cap > 0 else 0.0
+                    print(f"  shelter {sh}: inflow={inflow:.2f}, cap={cap:.2f}, util={util:.2%}")
+
         except ImportError:
-            print("错误：未找到 bus_assignment.py 或其中的 solve_bus_stage2。请先添加二阶段文件。")
+            print(
+                "错误：未找到 bus_assignment.py 或其中的 solve_bus_stage2_timesliced_edgeflow。请确认你已把新函数粘贴进 bus_assignment 文件。")
         except Exception as e:
             print(f"二阶段公交求解失败: {e}")
             import traceback
