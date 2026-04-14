@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple, Any, List, Optional
+from typing import Dict, Tuple, Any, List, Optional, Iterable
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -289,3 +289,281 @@ def format_flows_table(result: BusStage2Result) -> pd.DataFrame:
             "trips": trips,
         })
     return pd.DataFrame(rows)
+
+@dataclass
+class BusStage2EdgeFlowResult:
+    """
+    Time-sliced edge-flow result (people flow on edges per period).
+    f[(u,v,k,t)] = people moved on directed edge (u,v,k) during period t.
+    """
+    edge_flows: Dict[Tuple[int, int, int, int], float]
+    shelter_inflow_total: Dict[int, float]
+    shelter_inflow_by_period: Dict[Tuple[int, int], float]  # (shelter, t) -> people
+    gp_outflow_by_period: Dict[Tuple[int, int], float]      # (gp, t) -> people
+    total_distance_cost: float
+    status: str
+    summary: Dict[str, Any]
+
+
+def solve_bus_stage2_timesliced_edgeflow(
+    G: nx.MultiDiGraph,
+    gp_total_demand: Dict[int, float],
+    final_shelter_capacities: Dict[int, float],
+    edge_cap_vehph: Dict[Tuple[int, int, int, int], float],
+    period_shares: List[float],
+    weight: str = "length",
+    vehicle_capacity: int = 50,
+    period_hours: float = 2.0,
+    super_sink_node: int = -1,
+    time_limit_sec: Optional[int] = None,
+    msg: bool = False,
+) -> Dict[str, Any]:
+    """
+    Stage-2 (time-sliced edge-flow) model, matching your constraints:
+
+    Nodes:
+      - GP nodes are sources (supply) per period using Jamei shares.
+      - Ordinary road nodes have net flow 0 (flow conservation).
+      - Real shelters are intermediate nodes with capacity on total inflow.
+      - Super sink T collects all evacuated people; edges shelter->T have ~0 cost and infinite capacity.
+
+    Variables:
+      f_{e,t} >= 0  people flow on directed road edge e=(u,v,k) during period t
+      g_{h,t} >= 0  people flow on virtual edge (h -> T) during period t
+
+    Constraints:
+      (1) Node net flow:
+            For each period t:
+              For GP node s:   out-in = share[t] * demand[s]
+              For other nodes (except T): out-in = 0
+              For shelter h: out-in = -(flow entering shelter from road in period t) + g_{h,t}  (handled by conservation)
+            For super sink T: in-out = share[t] * total_demand  (equivalently out-in = -that)
+
+      (2) Road capacity per period:
+            f_{e,t} <= edge_cap_vehph[(u,v,k,t)] * period_hours * vehicle_capacity
+
+      (3) Shelter capacity (total over all periods):
+            sum_t inflow_to_shelter_from_road(h,t) <= final_shelter_capacities[h]
+
+      (4) All demand fully evacuated:
+            enforced by per-period supplies summing to total demand (shares must sum to 1)
+    """
+    if vehicle_capacity <= 0:
+        raise ValueError("vehicle_capacity must be a positive integer")
+    if period_hours <= 0:
+        raise ValueError("period_hours must be positive")
+    if not period_shares:
+        raise ValueError("period_shares must be a non-empty list")
+    if any(s < 0 for s in period_shares):
+        raise ValueError("period_shares must be non-negative")
+    share_sum = float(sum(period_shares))
+    if abs(share_sum - 1.0) > 1e-6:
+        raise ValueError(f"period_shares must sum to 1.0, got {share_sum}")
+
+    gp_total_demand = _as_int_node_keys(gp_total_demand)
+    final_shelter_capacities = _as_int_node_keys(final_shelter_capacities)
+
+    gp_nodes = [gp for gp, dem in gp_total_demand.items() if dem is not None and float(dem) > 0]
+    shelter_nodes = [sh for sh, cap in final_shelter_capacities.items() if cap is not None and float(cap) > 0]
+    if not gp_nodes:
+        raise ValueError("No gathering points with positive demand were provided.")
+    if not shelter_nodes:
+        raise ValueError("No final shelters with positive capacity were provided.")
+
+    T = int(super_sink_node)
+    periods = list(range(len(period_shares)))
+
+    # ---- Build node set involved in model ----
+    # Use all nodes in G, plus super sink (may not exist in G).
+    all_nodes: List[int] = [int(n) for n in G.nodes()]
+    if T in all_nodes:
+        raise ValueError(f"super_sink_node {T} already exists in G; choose a unique node id.")
+    nodes_plus_T = all_nodes + [T]
+
+    # ---- Precompute directed edges list from G (u,v,k) ----
+    road_edges: List[Tuple[int, int, int]] = []
+    for u, v, k in G.edges(keys=True):
+        road_edges.append((int(u), int(v), int(k)))
+
+    # Build adjacency lists for conservation constraints
+    out_edges_by_node: Dict[int, List[Tuple[int, int, int]]] = {n: [] for n in all_nodes}
+    in_edges_by_node: Dict[int, List[Tuple[int, int, int]]] = {n: [] for n in all_nodes}
+    for (u, v, k) in road_edges:
+        out_edges_by_node[u].append((u, v, k))
+        in_edges_by_node[v].append((u, v, k))
+
+    # sanity: shelters must exist in graph node set
+    missing_shelters = [sh for sh in shelter_nodes if sh not in G.nodes()]
+    if missing_shelters:
+        raise ValueError(f"Some shelter nodes are not in graph G: {missing_shelters}")
+    missing_gps = [gp for gp in gp_nodes if gp not in G.nodes()]
+    if missing_gps:
+        raise ValueError(f"Some GP nodes are not in graph G: {missing_gps}")
+
+    total_demand = float(sum(float(gp_total_demand[gp]) for gp in gp_nodes))
+
+    # Per-period supply at GP: share[t] * demand_gp
+    supply_gp_t: Dict[Tuple[int, int], float] = {}
+    for gp in gp_nodes:
+        dem = float(gp_total_demand[gp])
+        for t in periods:
+            supply_gp_t[(gp, t)] = dem * float(period_shares[t])
+
+    # For super sink: demand (inflow) per period
+    sink_inflow_t: Dict[int, float] = {t: total_demand * float(period_shares[t]) for t in periods}
+
+    # ---- Build LP ----
+    model = pulp.LpProblem("BusStage2_TimeSlicedEdgeFlow_MinTotalDistance", pulp.LpMinimize)
+
+    # Decision vars: road edge flows f[(u,v,k,t)] >= 0 (people)
+    f_vars: Dict[Tuple[int, int, int, int], pulp.LpVariable] = {}
+    for (u, v, k) in road_edges:
+        # edge length cost (meters)
+        data = G.get_edge_data(u, v, key=k) or {}
+        length = float(data.get(weight, data.get("length", 0.0)) or 0.0)
+
+        for t in periods:
+            # capacity in people/period
+            cap_vehph = float(edge_cap_vehph.get((u, v, k, t), 0.0))
+            cap_people = cap_vehph * float(period_hours) * float(vehicle_capacity)
+
+            # If cap is 0, we can skip var entirely (no flow allowed)
+            if cap_people <= 0:
+                continue
+
+            f_vars[(u, v, k, t)] = pulp.LpVariable(f"f_{u}_{v}_{k}_p{t}", lowBound=0, cat="Continuous")
+
+    # Virtual vars: g[(h,t)] >= 0 from shelter h to super sink T in period t (people)
+    g_vars: Dict[Tuple[int, int], pulp.LpVariable] = {}
+    for h in shelter_nodes:
+        for t in periods:
+            g_vars[(h, t)] = pulp.LpVariable(f"g_{h}_toT_p{t}", lowBound=0, cat="Continuous")
+
+    # Objective: sum over road edges length * people + virtual edges cost ~0 (ignore)
+    model += pulp.lpSum(
+        f_vars[(u, v, k, t)] * float((G.get_edge_data(u, v, key=k) or {}).get(weight, (G.get_edge_data(u, v, key=k) or {}).get("length", 0.0)) or 0.0)
+        for (u, v, k, t) in f_vars.keys()
+    )
+
+    # (2) Road capacity constraints per period: f_e,t <= cap_people
+    for (u, v, k, t), var in f_vars.items():
+        cap_vehph = float(edge_cap_vehph.get((u, v, k, t), 0.0))
+        cap_people = cap_vehph * float(period_hours) * float(vehicle_capacity)
+        model += (var <= cap_people), f"cap_edge_{u}_{v}_{k}_p{t}"
+
+    # (1) Node flow conservation per period (all road nodes + shelters, excluding T handled separately)
+    # For each node n in all_nodes:
+    #   sum_out_f - sum_in_f + (if n is shelter: g[n,t]) == (if n is GP: supply_gp_t[n,t] else 0)
+    #
+    # Explanation:
+    #   g[n,t] is an extra outflow term from shelter to T.
+    for n in all_nodes:
+        for t in periods:
+            out_terms = []
+            in_terms = []
+
+            for (u, v, k) in out_edges_by_node.get(n, []):
+                if (u, v, k, t) in f_vars:
+                    out_terms.append(f_vars[(u, v, k, t)])
+            for (u, v, k) in in_edges_by_node.get(n, []):
+                if (u, v, k, t) in f_vars:
+                    in_terms.append(f_vars[(u, v, k, t)])
+
+            # shelter extra outflow to super sink
+            if n in shelter_nodes:
+                out_terms.append(g_vars[(n, t)])
+
+            rhs = 0.0
+            if n in gp_nodes:
+                rhs = float(supply_gp_t[(n, t)])
+
+            model += (pulp.lpSum(out_terms) - pulp.lpSum(in_terms) == rhs), f"flow_cons_{n}_p{t}"
+
+    # Super sink constraints per period: inflow from shelters equals required sink inflow
+    for t in periods:
+        inflow_T = pulp.lpSum(g_vars[(h, t)] for h in shelter_nodes)
+        model += (inflow_T == float(sink_inflow_t[t])), f"sink_inflow_p{t}"
+
+    # (3) Shelter capacity constraints (total inflow from road across all periods <= cap)
+    # Inflow to shelter h is sum of road edges ending at h.
+    for h in shelter_nodes:
+        cap = float(final_shelter_capacities[h])
+        inflow_terms = []
+        for t in periods:
+            for (u, v, k) in in_edges_by_node.get(h, []):
+                if (u, v, k, t) in f_vars:
+                    inflow_terms.append(f_vars[(u, v, k, t)])
+        model += (pulp.lpSum(inflow_terms) <= cap), f"cap_shelter_{h}_total"
+
+    # Solve
+    solver = None
+    try:
+        solver = pulp.HiGHS_CMD(msg=msg, timeLimit=time_limit_sec)
+    except Exception:
+        solver = None
+    if solver is None:
+        solver = pulp.PULP_CBC_CMD(msg=msg, timeLimit=time_limit_sec)
+
+    model.solve(solver)
+    status_str = pulp.LpStatus.get(model.status, str(model.status))
+    if status_str == "Infeasible":
+        raise ValueError("Time-sliced edge-flow model is infeasible (check road capacities per period and shelter caps).")
+    if status_str not in ("Optimal", "Feasible", "Integer Feasible", "Optimal Infeasible"):
+        raise ValueError(f"Model did not solve to optimality. Status: {status_str}")
+
+    # Extract edge flows
+    edge_flows: Dict[Tuple[int, int, int, int], float] = {}
+    for key, var in f_vars.items():
+        val = var.value()
+        if val is None:
+            continue
+        val = float(val)
+        if val > 1e-8:
+            edge_flows[key] = val
+
+    # Shelter inflows
+    shelter_inflow_by_period: Dict[Tuple[int, int], float] = {(h, t): 0.0 for h in shelter_nodes for t in periods}
+    for (u, v, k, t), f in edge_flows.items():
+        if v in shelter_nodes:
+            shelter_inflow_by_period[(v, t)] += f
+
+    shelter_inflow_total: Dict[int, float] = {h: 0.0 for h in shelter_nodes}
+    for h in shelter_nodes:
+        shelter_inflow_total[h] = sum(shelter_inflow_by_period[(h, t)] for t in periods)
+
+    # GP outflows by period (from conservation; compute as sum of out edges)
+    gp_outflow_by_period: Dict[Tuple[int, int], float] = {(gp, t): 0.0 for gp in gp_nodes for t in periods}
+    for (u, v, k, t), f in edge_flows.items():
+        if u in gp_nodes:
+            gp_outflow_by_period[(u, t)] += f
+
+    total_cost = float(pulp.value(model.objective))
+
+    summary = {
+        "status": status_str,
+        "num_periods": len(periods),
+        "period_hours": float(period_hours),
+        "vehicle_capacity": int(vehicle_capacity),
+        "total_demand": float(total_demand),
+        "period_shares": [float(s) for s in period_shares],
+        "total_distance_cost": float(total_cost),
+        "num_road_edge_vars": len(f_vars),
+        "note": (
+            "Time-sliced edge-flow LP. Edge capacities are enforced per directed edge per period in people units: "
+            "cap_people = cap_vehph * period_hours * vehicle_capacity. "
+            "Super sink collects per-period evacuated amounts according to period_shares."
+        ),
+        "shelter_inflow_total": shelter_inflow_total,
+    }
+
+    result = BusStage2EdgeFlowResult(
+        edge_flows=edge_flows,
+        shelter_inflow_total=shelter_inflow_total,
+        shelter_inflow_by_period=shelter_inflow_by_period,
+        gp_outflow_by_period=gp_outflow_by_period,
+        total_distance_cost=total_cost,
+        status=status_str,
+        summary=summary,
+    )
+
+    return {"result": result, "summary": summary}
