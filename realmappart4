@@ -8,7 +8,7 @@
             print("错误：没有选择最终避难所(门)。请点击 'Final Shelter' 按钮进入模式并点选避难所、输入容量。")
             return
 
-                try:
+            try:
             from bus_assignment import solve_bus_stage2_timesliced_edgeflow
 
             # ====== 1) Jamei 曲线（4个时段，和为1）=====
