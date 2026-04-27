@@ -1,4 +1,4 @@
-    def run_bus_assignment(self, event):
+        def run_bus_assignment(self, event):
         """B1: 在 UI 中点击 Run Bus 后运行二阶段公交分配"""
         if self.gp_total_demand is None or len(self.gp_total_demand) == 0:
             print("错误：没有可用的集合点总需求量。请先 Optimize 并在提示中选择/应用一个解。")
@@ -8,7 +8,7 @@
             print("错误：没有选择最终避难所(门)。请点击 'Final Shelter' 按钮进入模式并点选避难所、输入容量。")
             return
 
-            try:
+        try:
             from bus_assignment import solve_bus_stage2_timesliced_edgeflow
 
             # ====== 1) Jamei 曲线（4个时段，和为1）=====
@@ -35,7 +35,7 @@
                 vehicle_capacity=50,
                 period_hours=2.0,
                 super_sink_node=-999999,  # 保证这个ID不在图里
-                msg=True,
+                msg=False,
             )
 
             self.bus_result = result
