@@ -198,6 +198,96 @@
                     print(f"  最少穿越次数: {np.min(valid_crossings)}")
                     print(f"  最多穿越次数: {np.max(valid_crossings)}")
 
+        # ====== A. 路网 + 流量（边越粗/颜色越深）======
+    def plot_bus_edge_flows(self, edge_flows, use_selected=False):
+        """
+        edge_flows: dict[(u,v,k,t)] = flow
+        use_selected=True 表示画选中的路网；否则画原始路网
+        """
+        if not edge_flows:
+            print("没有可视化的边流量数据")
+            return
+
+        # 1) 聚合：把不同时段加总成每条边的总流量
+        edge_total = {}
+        for (u, v, k, t), f in edge_flows.items():
+            edge_total[(u, v, k)] = edge_total.get((u, v, k), 0.0) + float(f)
+
+        # 2) 取图
+        G = self.selected_G if use_selected else self.original_G
+        nodes, edges = ox.graph_to_gdfs(G)
+
+        # 3) 把流量映射到 edges
+        flows = []
+        for (u, v, k) in edges.index:
+            flows.append(edge_total.get((u, v, k), 0.0))
+        edges["flow"] = flows
+
+        max_flow = max(flows) if len(flows) > 0 else 1.0
+        norm = colors.Normalize(vmin=0, vmax=max_flow)
+        cmap = cm.get_cmap("Reds")
+
+        # 线宽：0.5 ~ 4.5
+        widths = [0.5 + 4.0 * (f / max_flow) if max_flow > 0 else 0.5 for f in flows]
+        edge_colors = [cmap(norm(f)) for f in flows]
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        edges.plot(ax=ax, linewidth=widths, color=edge_colors, alpha=0.8)
+        nodes.plot(ax=ax, color="lightgrey", markersize=5, alpha=0.5)
+        ax.set_title("Bus Flow on Road Network")
+        sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+        plt.colorbar(sm, ax=ax, label="People Flow")
+        plt.show()
+
+    # ====== B. 避难所接收人数 ======
+    def plot_shelter_inflow(self, shelter_inflow_total):
+        if not shelter_inflow_total:
+            print("没有避难所流入数据")
+            return
+        shelters = list(shelter_inflow_total.keys())
+        values = list(shelter_inflow_total.values())
+
+        plt.figure(figsize=(8, 4))
+        plt.bar([str(s) for s in shelters], values, color="purple")
+        plt.xlabel("Shelter Node")
+        plt.ylabel("People")
+        plt.title("Shelter Inflow Total")
+        plt.show()
+
+    # ====== C. 各时段疏散总量 ======
+    def plot_total_by_period(self, shelter_inflow_by_period, num_periods):
+        if not shelter_inflow_by_period:
+            print("没有时段流量数据")
+            return
+
+        total = [0.0] * num_periods
+        for (h, t), v in shelter_inflow_by_period.items():
+            total[t] += v
+
+        plt.figure(figsize=(7, 4))
+        plt.plot(range(num_periods), total, marker="o")
+        plt.xlabel("Period")
+        plt.ylabel("People")
+        plt.title("Total Evacuation per Period")
+        plt.show()
+
+    # ====== D. 集合点出发量 ======
+    def plot_gp_outflow(self, gp_outflow_by_period):
+        if not gp_outflow_by_period:
+            print("没有集合点出发数据")
+            return
+
+        gp_total = {}
+        for (gp, t), v in gp_outflow_by_period.items():
+            gp_total[gp] = gp_total.get(gp, 0.0) + v
+
+        plt.figure(figsize=(8, 4))
+        plt.bar([str(g) for g in gp_total.keys()], list(gp_total.values()), color="green")
+        plt.xlabel("GP Node")
+        plt.ylabel("People")
+        plt.title("GP Outflow Total")
+        plt.show()
+
     def finalize_selection(self, event):
         if len(self.selected_nodes) == 0:
             print("Haven't select any available node")
