@@ -39,6 +39,12 @@
             )
 
             self.bus_result = result
+            res_obj = result.get("result")
+            if res_obj is not None:
+                self.plot_bus_edge_flows(res_obj.edge_flows)  # A
+                self.plot_shelter_inflow(res_obj.shelter_inflow_total)  # B
+                self.plot_total_by_period(res_obj.shelter_inflow_by_period, num_periods=T)  # C
+                self.plot_gp_outflow(res_obj.gp_outflow_by_period)  # D
             print("\n✅ 二阶段公交分配完成（分时段 + 道路容量 + 超级汇点）")
             print(result.get("summary", result))
 
