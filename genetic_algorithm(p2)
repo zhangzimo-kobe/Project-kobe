@@ -510,7 +510,8 @@
         plt.tight_layout()
         plt.savefig('nsga2_results.png', dpi=150, bbox_inches='tight')
         print(f"\n✓ 优化结果图已保存为 'nsga2_results. png'")
-        plt.show()
+        plt.show(block=False)
+        plt.pause(0.1)
 
     def export_results(self, filename: str = "pareto_solutions.csv"):
         """导出帕累托最优解到CSV文件"""
